@@ -13,28 +13,13 @@ from bot.external.transfermarkt import (
     TMError,
     TRANSFERMARKT_TEAM_IDS,
 )
-
 import os
 
 DISABLE_SOFA = os.environ.get("DISABLE_SOFASCORE") == "1"
 
+
 def _normalize_name(name: str) -> str:
     return name.strip().lower()
-
-
-async def _sync_from_sofascore(team) -> str:
-    sofa_id = SOFASCORE_TEAM_IDS.get(team.name)
-    if not sofa_id:
-        return f"No Sofascore ID for {team.name}"
-    players_raw = await sofa_fetch_players(sofa_id)
-    return await _upsert_players(team, [
-        {
-            "full_name": p.get("name") or p.get("shortName") or p.get("slug") or "",
-            "shirt_number": p.get("shirtNumber") or p.get("jerseyNumber"),
-            "position_main": _map_main_sofa(p.get("position")),
-            "position_detail": _detail_sofa(p),
-        } for p in players_raw
-    ])
 
 
 def _map_main_sofa(pos_raw):
@@ -71,41 +56,6 @@ def _detail_sofa(p: dict):
     return mapping.get(desc, desc[:12]) if desc else None
 
 
-async def _sync_from_transfermarkt(team) -> str:
-    squad = await fetch_team_squad(team.name)
-    report_players = await _upsert_players(team, squad)
-
-    # Травмы / дисквалы
-    injuries = await fetch_injury_list(team.name)
-    if injuries:
-        async with SessionLocal() as session:
-            # Получим текущих игроков
-            stmt = select(Player).where(Player.team_id == team.id)
-            res = await session.execute(stmt)
-            players = res.scalars().all()
-            by_name = {_normalize_name(p.full_name): p for p in players}
-
-            created_status = 0
-            for it in injuries:
-                nm = _normalize_name(it["full_name"])
-                player = by_name.get(nm)
-                if not player:
-                    continue
-                # Добавим статус (упрощённо, без проверки дубликатов для MVP)
-                status = PlayerStatus(
-                    player_id=player.id,
-                    type="injury",
-                    availability="OUT",
-                    reason=it["reason"][:180] if it["reason"] else None,
-                    raw_status=it["reason"],
-                )
-                session.add(status)
-                created_status += 1
-            await session.commit()
-        report_players += f"; statuses={created_status}"
-    return report_players
-
-
 async def _upsert_players(team, player_dicts):
     async with SessionLocal() as session:
         stmt = select(Player).where(Player.team_id == team.id)
@@ -129,6 +79,7 @@ async def _upsert_players(team, player_dicts):
                 changed = False
                 if p.position_main != pos_main:
                     p.position_main = pos_main; changed = True
+                # Обновляем detail даже если None раньше
                 if pos_detail and p.position_detail != pos_detail:
                     p.position_detail = pos_detail; changed = True
                 if number and p.shirt_number != number:
@@ -148,6 +99,52 @@ async def _upsert_players(team, player_dicts):
     return f"created={created}, updated={updated}, total_now={created+len(existing)}"
 
 
+async def _sync_from_sofascore(team) -> str:
+    sofa_id = SOFASCORE_TEAM_IDS.get(team.name)
+    if not sofa_id:
+        return f"No Sofascore ID for {team.name}"
+    players_raw = await sofa_fetch_players(sofa_id)
+    return await _upsert_players(team, [
+        {
+            "full_name": p.get("name") or p.get("shortName") or p.get("slug") or "",
+            "shirt_number": p.get("shirtNumber") or p.get("jerseyNumber"),
+            "position_main": _map_main_sofa(p.get("position")),
+            "position_detail": _detail_sofa(p),
+        } for p in players_raw
+    ])
+
+
+async def _sync_from_transfermarkt(team) -> str:
+    squad = await fetch_team_squad(team.name)
+    report_players = await _upsert_players(team, squad)
+    injuries = await fetch_injury_list(team.name)
+    if injuries:
+        async with SessionLocal() as session:
+            stmt = select(Player).where(Player.team_id == team.id)
+            res = await session.execute(stmt)
+            players = res.scalars().all()
+            by_name = {_normalize_name(p.full_name): p for p in players}
+
+            created_status = 0
+            for it in injuries:
+                nm = _normalize_name(it["full_name"])
+                player = by_name.get(nm)
+                if not player:
+                    continue
+                status = PlayerStatus(
+                    player_id=player.id,
+                    type="injury",
+                    availability="OUT",
+                    reason=it["reason"][:180] if it["reason"] else None,
+                    raw_status=it["reason"],
+                )
+                session.add(status)
+                created_status += 1
+            await session.commit()
+        report_players += f"; statuses={created_status}"
+    return report_players
+
+
 async def sync_team_roster(team_name: str):
     async with SessionLocal() as session:
         stmt = select(Team).where(Team.name == team_name)
@@ -156,17 +153,12 @@ async def sync_team_roster(team_name: str):
         if not team:
             return f"Team '{team_name}' not found."
 
-    # Порядок: Sofa → (при 403/любая ошибка) → Transfermarkt
     if not DISABLE_SOFA and team_name in SOFASCORE_TEAM_IDS:
         try:
             return f"{team_name} (Sofa): " + await _sync_from_sofascore(team)
-        except SofascoreError as e:
-            # fallback на TM
+        except Exception:
             pass
-        except Exception as e:
-            pass  # всё равно fallback
 
-    # Transfermarkt fallback
     if team_name in TRANSFERMARKT_TEAM_IDS:
         try:
             return f"{team_name} (TM): " + await _sync_from_transfermarkt(team)
@@ -174,7 +166,7 @@ async def sync_team_roster(team_name: str):
             return f"{team_name} TM error: {e}"
         except Exception as e:
             return f"{team_name} unexpected TM error: {e}"
-    return f"{team_name}: no data source (no IDs)."
+    return f"{team_name}: no data source."
 
 
 async def sync_multiple_teams(team_names: List[str]):
