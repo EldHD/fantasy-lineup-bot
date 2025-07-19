@@ -1,5 +1,5 @@
 from typing import List
-from sqlalchemy import select
+from sqlalchemy import select, update
 from bot.db.database import SessionLocal
 from bot.db.models import Team, Player, PlayerStatus, Tournament
 from bot.external.sofascore import (
@@ -14,6 +14,9 @@ from bot.external.transfermarkt import (
     TRANSFERMARKT_TEAM_IDS,
 )
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 DISABLE_SOFA = os.environ.get("DISABLE_SOFASCORE") == "1"
 
@@ -58,25 +61,40 @@ def _detail_sofa(p: dict):
 
 async def ensure_teams_exist(team_names: List[str], tournament_code: str):
     """
-    Создаёт записи Team для отсутствующих команд.
-    Требует, чтобы Tournament с кодом существовал.
+    Создаёт команды с привязкой к турниру.
+    Если турнир отсутствует – создаёт.
+    Если команда есть, но без tournament_id – ставит.
+    Возвращает количество *новых* созданных команд.
     """
     async with SessionLocal() as session:
+        # Турнир
         t_res = await session.execute(select(Tournament).where(Tournament.code == tournament_code))
         tournament = t_res.scalar_one_or_none()
         if not tournament:
-            # Создадим турнир быстро (MVP)
             tournament = Tournament(code=tournament_code, name=tournament_code.upper())
             session.add(tournament)
             await session.flush()
+            logger.info("Created tournament %s (id=%s)", tournament_code, tournament.id)
+
+        # Существующие команды
         existing_res = await session.execute(select(Team).where(Team.name.in_(team_names)))
-        existing = {t.name for t in existing_res.scalars().all()}
+        existing = existing_res.scalars().all()
+        existing_by_name = {t.name: t for t in existing}
+
         created = 0
+        repaired = 0
         for name in team_names:
-            if name not in existing:
-                session.add(Team(name=name))
+            team = existing_by_name.get(name)
+            if team:
+                # если уже есть, но нет привязки к турниру – дополним
+                if getattr(team, "tournament_id", None) in (None, 0):
+                    team.tournament_id = tournament.id
+                    repaired += 1
+            else:
+                session.add(Team(name=name, tournament_id=tournament.id))
                 created += 1
-        if created:
+
+        if created or repaired:
             await session.commit()
         return created
 
@@ -104,7 +122,10 @@ async def _upsert_players(team, player_dicts):
                 changed = False
                 if p.position_main != pos_main:
                     p.position_main = pos_main; changed = True
-                if pos_detail and p.position_detail != pos_detail:
+                if pos_detail and p.
+
+Eldar Khayretdinov, [19.07.2025 19:17]
+position_detail != pos_detail:
                     p.position_detail = pos_detail; changed = True
                 if number and p.shirt_number != number:
                     p.shirt_number = number; changed = True
@@ -155,10 +176,9 @@ async def _sync_from_transfermarkt(team) -> str:
                 player = by_name.get(nm)
                 if not player:
                     continue
-                # Простая вставка без проверки дубликатов (MVP)
                 status = PlayerStatus(
                     player_id=player.id,
-                    type="injury" if "suspens" not in (it["reason"].lower()) and "Suspension" not in it["reason"] else "suspension",
+                    type="injury" if "Suspension" not in it["reason"] else "suspension",
                     availability="OUT",
                     reason=it["reason"][:180] if it["reason"] else None,
                     raw_status=it["reason"],
@@ -178,12 +198,14 @@ async def sync_team_roster(team_name: str):
         if not team:
             return f"Team '{team_name}' not found."
 
+    # Sofascore (если не отключен)
     if not DISABLE_SOFA and team_name in SOFASCORE_TEAM_IDS:
         try:
             return f"{team_name} (Sofa): " + await _sync_from_sofascore(team)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Sofascore sync fail %s: %s", team_name, e)
 
+    # Transfermarkt
     if team_name in TRANSFERMARKT_TEAM_IDS:
         try:
             return f"{team_name} (TM): " + await _sync_from_transfermarkt(team)
