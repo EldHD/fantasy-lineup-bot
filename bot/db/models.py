@@ -2,6 +2,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import Integer, String, DateTime, ForeignKey, Boolean, Text
 import datetime as dt
 
+
 class Base(DeclarativeBase):
     pass
 
@@ -54,11 +55,12 @@ class Player(Base):
     team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"))
     full_name: Mapped[str] = mapped_column(String(120), index=True)
     shirt_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    position_main: Mapped[str] = mapped_column(String(30))          # goalkeeper, defender, midfielder, forward
-    position_detail: Mapped[str | None] = mapped_column(String(50)) # e.g. "CB", "LW"
+    position_main: Mapped[str] = mapped_column(String(30))
+    position_detail: Mapped[str | None] = mapped_column(String(50))
 
     team: Mapped["Team"] = relationship(back_populates="players")
     predictions: Mapped[list["Prediction"]] = relationship(back_populates="player")
+    statuses: Mapped[list["PlayerStatus"]] = relationship(back_populates="player")
 
 
 class Prediction(Base):
@@ -67,9 +69,31 @@ class Prediction(Base):
     match_id: Mapped[int] = mapped_column(ForeignKey("matches.id"))
     player_id: Mapped[int] = mapped_column(ForeignKey("players.id"))
     will_start: Mapped[bool] = mapped_column(Boolean, default=True)
-    probability: Mapped[int] = mapped_column(Integer)  # 0..100
+    probability: Mapped[int] = mapped_column(Integer)
     explanation: Mapped[str | None] = mapped_column(Text)
-    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc))
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
 
     match: Mapped["Match"] = relationship(back_populates="predictions")
     player: Mapped["Player"] = relationship(back_populates="predictions")
+
+
+class PlayerStatus(Base):
+    """
+    Текущий статус доступности игрока.
+    type: injury | suspension | doubt | illness | rest | other
+    availability: OUT / DOUBT / OK
+    """
+    __tablename__ = "player_status"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    player_id: Mapped[int] = mapped_column(ForeignKey("players.id"), index=True)
+    type: Mapped[str] = mapped_column(String(20))
+    availability: Mapped[str] = mapped_column(String(10))  # OUT / DOUBT / OK
+    reason: Mapped[str | None] = mapped_column(Text)
+    source_url: Mapped[str | None] = mapped_column(String(300))
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
+
+    player: Mapped["Player"] = relationship(back_populates="statuses")
