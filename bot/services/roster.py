@@ -3,7 +3,7 @@ import re
 import random
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from sqlalchemy import select
@@ -50,6 +50,21 @@ FIXED_TEAM_CODES = {
     "Zenit": "ZEN",
     "CSKA Moscow": "CSKA",
 }
+
+
+# ---------- Date Helpers ---------- #
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _to_utc_aware(dt: Optional[datetime]) -> Optional[datetime]:
+    """Привести любой datetime к tz-aware UTC. Если None – вернуть None."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    # нормализуем в UTC
+    return dt.astimezone(timezone.utc)
 
 
 # ---------- Utility ---------- #
@@ -119,19 +134,22 @@ async def ensure_teams_exist(team_names: List[str], tournament_code: str):
         existing = existing_res.scalars().all()
         existing_by_name = {t.name: t for t in existing}
 
-        # Все коды
+        # Все команды — для занятости кодов
         all_team_res = await session.execute(select(Team))
         all_teams = all_team_res.scalars().all()
         occupied = {t.code for t in all_teams if getattr(t, "code", None)}
 
         def uniq(code: str) -> str:
+            code = code.upper()
             if code not in occupied:
                 occupied.add(code)
                 return code
             base = code
             idx = 2
             while True:
-                cand = (base[: (12 - len(str(idx)) - 1)] + f"_{idx}").upper()
+                suffix = f"_{idx}"
+                limit = 12 - len(suffix)
+                cand = (base[:limit] + suffix).upper()
                 if cand not in occupied:
                     occupied.add(cand)
                     return cand
@@ -248,6 +266,8 @@ async def _sync_from_transfermarkt(team) -> str:
     rep_players = await _upsert_players(team, squad)
 
     injuries = await fetch_injury_list(team.name)
+    created_status = 0
+
     if injuries:
         async with SessionLocal() as session:
             stmt = select(Player).where(Player.team_id == team.id)
@@ -255,37 +275,46 @@ async def _sync_from_transfermarkt(team) -> str:
             players = res.scalars().all()
             by_name = {_normalize_name(p.full_name): p for p in players}
 
-            cutoff = datetime.utcnow() - timedelta(days=14)
+            cutoff = _now_utc() - timedelta(days=14)
+
             st_res = await session.execute(
                 select(PlayerStatus).where(PlayerStatus.player_id.in_([p.id for p in players]))
             )
             existing_statuses = st_res.scalars().all()
-            existing_signature = {
-                (s.player_id, (s.raw_status or "").lower()): s
-                for s in existing_statuses
-                if getattr(s, "created_at", cutoff) >= cutoff
-            }
 
-            created_status = 0
+            # Нормализуем время
+            existing_signature = {}
+            for s in existing_statuses:
+                created_at = _to_utc_aware(getattr(s, "created_at", None))
+                if created_at and created_at >= cutoff:
+                    sig = (s.player_id, (s.raw_status or "").lower())
+                    existing_signature[sig] = s
+
             for it in injuries:
                 nm = _normalize_name(it["full_name"])
                 player = by_name.get(nm)
                 if not player:
                     continue
-                sig_key = (player.id, it["reason"].lower())
+                reason = (it["reason"] or "").strip()
+                if not reason:
+                    continue
+                sig_key = (player.id, reason.lower())
                 if sig_key in existing_signature:
                     continue
                 status = PlayerStatus(
                     player_id=player.id,
-                    type="injury" if "suspension" not in it["reason"].lower() else "suspension",
+                    type="injury" if "suspens" not in reason.lower() else "suspension",
                     availability="OUT",
-                    reason=it["reason"][:180],
-                    raw_status=it["reason"],
+                    reason=reason[:180],
+                    raw_status=reason,
                 )
                 session.add(status)
                 created_status += 1
+
             if created_status:
                 await session.commit()
+
+    if created_status:
         rep_players += f"; statuses={created_status}"
     return rep_players
 
@@ -300,12 +329,12 @@ async def sync_team_roster(team_name: str):
         if not team:
             return f"Team '{team_name}' not found."
 
-    # Sofascore сначала
+    # Sofascore (если включено)
     if not DISABLE_SOFA and team_name in SOFASCORE_TEAM_IDS:
         try:
             return f"{team_name} (Sofa): " + await _sync_from_sofascore(team)
         except Exception as e:
-            logger.warning("Sofa fail %s: %s", team_name, e)
+            logger.warning("Sofascore fail %s: %s", team_name, e)
 
     # Transfermarkt
     if team_name in TRANSFERMARKT_TEAM_IDS:
@@ -314,6 +343,7 @@ async def sync_team_roster(team_name: str):
         except TMError as e:
             return f"{team_name} TM error: {e}"
         except Exception as e:
+            logger.exception("Unexpected TM error for %s", team_name)
             return f"{team_name} unexpected TM error: {e}"
 
     return f"{team_name}: no data source."
@@ -321,8 +351,7 @@ async def sync_team_roster(team_name: str):
 
 async def sync_multiple_teams(team_names: List[str], delay_between: float = 3.2):
     """
-    Последовательно, с паузой (анти-бот).
-    delay_between – базовая задержка, плюс случайный шум.
+    Последовательно, с паузой (анти-бот). + случайный шум.
     """
     reports = []
     for name in team_names:
