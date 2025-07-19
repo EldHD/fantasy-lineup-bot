@@ -1,5 +1,13 @@
+import os
+import re
+import random
+import asyncio
+import logging
+from datetime import datetime, timedelta
 from typing import List, Optional
+
 from sqlalchemy import select
+
 from bot.db.database import SessionLocal
 from bot.db.models import Team, Player, PlayerStatus, Tournament
 from bot.external.sofascore import (
@@ -12,16 +20,12 @@ from bot.external.transfermarkt import (
     TMError,
     TRANSFERMARKT_TEAM_IDS,
 )
-import os
-import logging
-import re
-import asyncio
-from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
 DISABLE_SOFA = os.environ.get("DISABLE_SOFASCORE") == "1"
 
+# Короткие фиксированные коды (≤12)
 FIXED_TEAM_CODES = {
     "Arsenal": "ARS",
     "Aston Villa": "AVL",
@@ -46,6 +50,7 @@ FIXED_TEAM_CODES = {
     "Zenit": "ZEN",
     "CSKA Moscow": "CSKA",
 }
+
 
 # ---------- Utility ---------- #
 
@@ -92,10 +97,16 @@ def _fallback_code(name: str) -> str:
     slug = slug[:12]
     return slug.upper()
 
+
 # ---------- Ensure Teams ---------- #
 
 async def ensure_teams_exist(team_names: List[str], tournament_code: str):
+    """
+    Создаёт команды, если отсутствуют. Дополняет code/tournament_id если пусто.
+    Возвращает количество новых команд.
+    """
     async with SessionLocal() as session:
+        # Турнир
         t_res = await session.execute(select(Tournament).where(Tournament.code == tournament_code))
         tournament = t_res.scalar_one_or_none()
         if not tournament:
@@ -103,10 +114,12 @@ async def ensure_teams_exist(team_names: List[str], tournament_code: str):
             session.add(tournament)
             await session.flush()
 
+        # Уже есть
         existing_res = await session.execute(select(Team).where(Team.name.in_(team_names)))
         existing = existing_res.scalars().all()
         existing_by_name = {t.name: t for t in existing}
 
+        # Все коды
         all_team_res = await session.execute(select(Team))
         all_teams = all_team_res.scalars().all()
         occupied = {t.code for t in all_teams if getattr(t, "code", None)}
@@ -115,8 +128,8 @@ async def ensure_teams_exist(team_names: List[str], tournament_code: str):
             if code not in occupied:
                 occupied.add(code)
                 return code
-            idx = 2
             base = code
+            idx = 2
             while True:
                 cand = (base[: (12 - len(str(idx)) - 1)] + f"_{idx}").upper()
                 if cand not in occupied:
@@ -133,9 +146,11 @@ async def ensure_teams_exist(team_names: List[str], tournament_code: str):
             if len(code_raw) > 12:
                 code_raw = code_raw[:12]
             if not team:
-                team = Team(name=name,
-                            code=uniq(code_raw),
-                            tournament_id=tournament.id)
+                team = Team(
+                    name=name,
+                    code=uniq(code_raw),
+                    tournament_id=tournament.id
+                )
                 session.add(team)
                 created += 1
             else:
@@ -146,6 +161,9 @@ async def ensure_teams_exist(team_names: List[str], tournament_code: str):
                 if not getattr(team, "code", None):
                     team.code = uniq(code_raw)
                     changed = True
+                elif len(team.code) > 12:
+                    team.code = uniq(team.code[:12])
+                    changed = True
                 if changed:
                     repaired += 1
 
@@ -154,6 +172,7 @@ async def ensure_teams_exist(team_names: List[str], tournament_code: str):
             logger.info("Teams ensure created=%s repaired=%s", created, repaired)
 
         return created
+
 
 # ---------- Players Upsert ---------- #
 
@@ -196,18 +215,18 @@ async def _upsert_players(team, player_dicts):
                 ))
                 created += 1
         await session.commit()
-    return f"created={created}, updated={updated}, total_now={created+len(existing)}"
+    return f"created={created}, updated={updated}, total_now={created + len(existing)}"
 
-# ---------- Sources ---------- #
+
+# ---------- Sources: Sofascore ---------- #
 
 async def _sync_from_sofascore(team) -> str:
     sofa_id = SOFASCORE_TEAM_IDS.get(team.name)
     if not sofa_id:
         return f"No Sofascore ID for {team.name}"
-    players_raw = await sofa_fetch_players(sofa_id)
-    # Ограничим до 40 (safety)
+    raw = await sofa_fetch_players(sofa_id)
     cleaned = []
-    for p in players_raw[:60]:
+    for p in raw[:60]:
         fullname = p.get("name") or p.get("shortName") or p.get("slug") or ""
         if not fullname.strip():
             continue
@@ -221,6 +240,9 @@ async def _sync_from_sofascore(team) -> str:
             break
     return await _upsert_players(team, cleaned)
 
+
+# ---------- Sources: Transfermarkt ---------- #
+
 async def _sync_from_transfermarkt(team) -> str:
     squad = await fetch_team_squad(team.name)
     rep_players = await _upsert_players(team, squad)
@@ -233,7 +255,6 @@ async def _sync_from_transfermarkt(team) -> str:
             players = res.scalars().all()
             by_name = {_normalize_name(p.full_name): p for p in players}
 
-            # Возьмём существующие статусы за последние 14 дней для фильтра дублей
             cutoff = datetime.utcnow() - timedelta(days=14)
             st_res = await session.execute(
                 select(PlayerStatus).where(PlayerStatus.player_id.in_([p.id for p in players]))
@@ -242,7 +263,7 @@ async def _sync_from_transfermarkt(team) -> str:
             existing_signature = {
                 (s.player_id, (s.raw_status or "").lower()): s
                 for s in existing_statuses
-                if getattr(s, "created_at", cutoff) >= cutoff  # если нет поля created_at – просто пройдёт
+                if getattr(s, "created_at", cutoff) >= cutoff
             }
 
             created_status = 0
@@ -268,6 +289,7 @@ async def _sync_from_transfermarkt(team) -> str:
         rep_players += f"; statuses={created_status}"
     return rep_players
 
+
 # ---------- Public API ---------- #
 
 async def sync_team_roster(team_name: str):
@@ -285,7 +307,7 @@ async def sync_team_roster(team_name: str):
         except Exception as e:
             logger.warning("Sofa fail %s: %s", team_name, e)
 
-    # Потом Transfermarkt
+    # Transfermarkt
     if team_name in TRANSFERMARKT_TEAM_IDS:
         try:
             return f"{team_name} (TM): " + await _sync_from_transfermarkt(team)
@@ -296,10 +318,11 @@ async def sync_team_roster(team_name: str):
 
     return f"{team_name}: no data source."
 
+
 async def sync_multiple_teams(team_names: List[str], delay_between: float = 3.2):
     """
-    Последовательно, чтобы не словить антибот.
-    delay_between – базовая задержка + небольшой рандом.
+    Последовательно, с паузой (анти-бот).
+    delay_between – базовая задержка, плюс случайный шум.
     """
     reports = []
     for name in team_names:
