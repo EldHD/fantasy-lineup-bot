@@ -17,17 +17,6 @@ LEAGUES = [
     ("Russian Premier League", "rpl"),
 ]
 
-TEAM_FORMATIONS = {
-    "Arsenal": ["4-2-3-1"],
-    "Chelsea": ["4-2-3-1"],
-    "Zenit": ["4-2-3-1"],
-    "CSKA Moscow": ["4-3-3"],
-}
-
-def parse_formation(code: str):
-    parts = [int(p) for p in code.split("-")]
-    return {"code": code, "def": parts[0], "mid": sum(parts[1:-1]), "fwd": parts[-1]}
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(name, callback_data=f"league_{code}")] for name, code in LEAGUES]
     markup = InlineKeyboardMarkup(keyboard)
@@ -118,7 +107,7 @@ async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_
             f"Матчи ({league_code.upper()}):",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
-    except Exception as e:
+    except Exception:
         await query.edit_message_text(
             f"Произошла ошибка при загрузке матчей для {league_code.upper()} :(",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ К лигам", callback_data="back_leagues")]])
@@ -137,7 +126,7 @@ async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAUL
         return
     header = (
         f"{match['home']['name']} vs {match['away']['name']}\n"
-        f"Matchweek {match['round']}\n"
+        f"{match['round']}\n"
         f"Kickoff: {match['utc_kickoff']:%Y-%m-%d %H:%M UTC}\n\nВыберите команду:"
     )
     buttons = [
@@ -166,22 +155,17 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    # Формирование вывода
     formation_code = "4-2-3-1"
-    # Раскладываем
-    starters = [r for r in rows if r["will_start"]]
+    starters = [r for r in rows if r["will_start"] and r["status_availability"] != "OUT"]
     starters.sort(key=lambda r: -r["probability"])
-    if len(starters) > 11:
-        starters = starters[:11]
-
-    bench = [r for r in rows if not r["will_start"] and r["status_availability"] != "OUT"]
+    starters = starters[:11]
     out_players = [r for r in rows if r["status_availability"] == "OUT"]
+    bench = [r for r in rows if not r["will_start"] and r["status_availability"] != "OUT"]
 
     def line_tag(r):
         d = (r["position_detail"] or "").upper()
         pm = r["position_main"]
-        if pm == "goalkeeper" or d == "GK":
-            return "GK"
+        if pm == "goalkeeper" or d == "GK": return "GK"
         DEF = {"CB","LCB","RCB","LB","RB","LWB","RWB"}
         DM = {"DM","CDM"}
         CM = {"CM"}
@@ -205,7 +189,6 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
     starters_sorted = []
     for tag in order_line:
         starters_sorted.extend([r for r in starters if r["_lt"] == tag])
-    # остаток
     starters_sorted.extend([r for r in starters if r not in starters_sorted])
 
     def fmt_player(r):
@@ -213,9 +196,8 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
         pos = r["position_detail"] or r["position_main"]
         return f"{num} {r['full_name']} ({pos}) {r['probability']}%"
 
-    # Блоки старта по линиям
     def block(tag, title):
-        items = [fmt_player(r) for r in starters_sorted if r["_lt"] == tag]
+        items = [fmt_player(r) for r in starters_sorted if r.get("_lt") == tag]
         if items:
             return f"{title}:\n" + "\n".join(items)
         return ""
@@ -229,11 +211,11 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
         block("WG", "⚡ Wings"),
         block("CF", "🎯 CF"),
     ]
-    start_text = "\n\n".join([b for b in start_blocks if b])
+    start_text = "\n\n".join([b for b in start_blocks if b]) or "(нет данных)"
 
     def fmt_out(r):
         pos = r["position_detail"] or r["position_main"]
-        reason = r["status_reason"] or r["explanation"] or "No reason"
+        reason = r["status_reason"] or "Unavailable"
         return f"{r['full_name']} ({pos}) — ❌ {reason}"
 
     def fmt_bench(r):
@@ -241,28 +223,29 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
         return f"{r['full_name']} ({pos}) {r['probability']}%"
 
     out_text = "\n".join(fmt_out(r) for r in out_players) if out_players else "—"
-    bench_text = "\n".join(fmt_bench(r) for r in bench[:12]) if bench else "—"
+    bench_text = "\n".join(fmt_bench(r) for r in bench[:15]) if bench else "—"
 
     lines = [
         f"Схема: {formation_code}",
-        "✅ **Старт (11):**",
-        start_text if start_text else "(нет данных)",
+        f"✅ **Старт (11)**:",
+        start_text,
         "",
-        "❌ **Не сыграют:**",
+        "❌ **Не сыграют**:",
         out_text,
         "",
-        "🔁 **Скамейка / опция:**",
+        "🔁 **Скамейка / ротация**:",
         bench_text
     ]
     text = "\n".join(lines)
-    if len(text) > 3800:
-        text = text[:3800] + "\n… (обрезано)"
+    if len(text) > 3900:
+        text = text[:3900] + "\n… (обрезано)"
 
     buttons = [
         [InlineKeyboardButton("⬅ Другая команда", callback_data=f"matchdb_{match_id}")],
         [InlineKeyboardButton("🏁 Лиги", callback_data="back_leagues")]
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+
 
 async def debug_catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
