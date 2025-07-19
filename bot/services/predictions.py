@@ -1,8 +1,9 @@
 from sqlalchemy import select, delete
 from bot.db.database import SessionLocal
 from bot.db.models import Player, Prediction, Match, PlayerStatus
-from typing import List
+from typing import List, Dict
 
+# Расширяем отображение деталей в унифицированные линии
 ROLE_MAP_DETAIL = {
     "GK": "GK",
     "CB": "DEF", "LCB": "DEF", "RCB": "DEF",
@@ -11,8 +12,9 @@ ROLE_MAP_DETAIL = {
     "CM": "CM",
     "AM": "AM", "CAM": "AM", "10": "AM",
     "LW": "WG", "RW": "WG",
-    "CF": "CF", "ST": "CF", "SS": "CF"
+    "CF": "CF", "ST": "CF", "SS": "CF", "STRIKER": "CF", "FORWARD": "CF"
 }
+
 
 def classify_line(player):
     d = (player.position_detail or "").upper()
@@ -21,6 +23,21 @@ def classify_line(player):
         return "GK"
     if d in ROLE_MAP_DETAIL:
         return ROLE_MAP_DETAIL[d]
+    # эвристики по тексту
+    if "BACK" in d:
+        return "DEF"
+    if "WING" in d:
+        return "WG"
+    if "STRIK" in d or "FORWARD" in d or "ATT" in d:
+        return "CF"
+    if "MID" in d:
+        # если есть DEF в тексте — опорник
+        if "DEF" in d:
+            return "DM"
+        if "ATT" in d:
+            return "AM"
+        return "CM"
+    # fallback по основной позиции
     if pm == "defender":
         return "DEF"
     if pm == "forward":
@@ -37,92 +54,100 @@ def sort_players(block):
     ))
 
 
-def distribute_starters(players):
+def distribute_starters(healthy_players):
     """
-    Схема 4-2-3-1
-    1 GK, 4 DEF, 2 (DM/CM), 3 (AM/WG/CM), 1 CF
+    Гибкая сборка 4-2-3-1:
+    - 1 GK
+    - 4 DEF
+    - 2 (DM/CM)
+    - 3 (AM/WG/CM)
+    - 1 CF (fallback если нет)
+    Всегда возвращает ровно 11 (если игроков >= 11).
     """
-    gk = [p for p in players if p._line == "GK"]
-    df = [p for p in players if p._line == "DEF"]
-    dm = [p for p in players if p._line == "DM"]
-    cm = [p for p in players if p._line == "CM"]
-    am = [p for p in players if p._line == "AM"]
-    wg = [p for p in players if p._line == "WG"]
-    cf = [p for p in players if p._line == "CF"]
-
-    gk = sort_players(gk)
-    df = sort_players(df)
-    dm = sort_players(dm)
-    cm = sort_players(cm)
-    am = sort_players(am)
-    wg = sort_players(wg)
-    cf = sort_players(cf)
+    # Группы
+    gk = sort_players([p for p in healthy_players if p._line == "GK"])
+    df = sort_players([p for p in healthy_players if p._line == "DEF"])
+    dm = sort_players([p for p in healthy_players if p._line == "DM"])
+    cm = sort_players([p for p in healthy_players if p._line == "CM"])
+    am = sort_players([p for p in healthy_players if p._line == "AM"])
+    wg = sort_players([p for p in healthy_players if p._line == "WG"])
+    cf = sort_players([p for p in healthy_players if p._line == "CF"])
 
     starters = []
 
     # 1 GK
-    if gk: starters.append(gk[0])
+    if gk:
+        starters.append(gk[0])
 
-    # 4 DEF
+    # 4 DEF (или сколько есть)
     starters.extend(df[:4])
 
-    # 2 deeper mids (DM first, then CM)
+    # 2 deeper mids (DM приоритет, потом CM)
     deeper_pool = dm + cm
     starters.extend(deeper_pool[:2])
 
-    # 3 attacking mids: AM + WG + оставшиеся CM
+    # 3 атакующие (AM + WG + оставшиеся CM)
     att_pool = am + wg + cm[2:]
-    starters.extend(att_pool[:3])
+    for p in att_pool:
+        if len([s for s in starters if s not in gk]) >= 1 + 4 + 2 + 3:  # уже взяли нужное
+            break
+        if p not in starters:
+            starters.append(p)
 
-    # 1 CF
+    # CF
     if cf:
-        if cf[0] not in starters:
-            starters.append(cf[0])
+        # берём лучшего
+        best_cf = cf[0]
+        if best_cf not in starters:
+            starters.append(best_cf)
+    else:
+        # Fallback: попытка взять ещё одного атакующего из AM/WG/CM/DM
+        fallback_pool = am + wg + cm + dm
+        for cand in fallback_pool:
+            if cand not in starters:
+                starters.append(cand)
+                break
 
-    # Если не 11 — добираем из оставшихся
+    # Теперь доводим до 11, если вдруг ещё меньше
     if len(starters) < 11:
-        remaining = [p for p in players if p not in starters]
+        remaining = [p for p in healthy_players if p not in starters]
         starters.extend(remaining[:(11 - len(starters))])
 
-    # Ровно 11
+    # Ровно 11 (если игроков достаточно)
     return starters[:11]
 
 
 def assign_probabilities(starters, bench, statuses_map):
     """
-    Возвращает dict player_id -> (will_start, probability, explanation)
-    OUT не в старте, bench/out получают свои диапазоны.
+    Возвращает {player_id: (will_start, probability, explanation)}
+    OUT = 3%, will_start=False.
+    Bench = 60%.
+    Стартеры 95→80 плавной линейкой.
     """
     result = {}
 
-    # Порядок для градации
     line_priority = {"GK": 0, "DEF": 1, "DM": 2, "CM": 3, "AM": 4, "WG": 5, "CF": 6}
     starters_sorted = sorted(starters, key=lambda p: (line_priority.get(p._line, 9), p.full_name.lower()))
-
     total = len(starters_sorted)
+
     for idx, p in enumerate(starters_sorted):
-        base_top = 95
-        base_low = 80
-        # линейная интерполяция
-        if total > 1:
-            frac = idx / (total - 1)
-            prob = round(base_top - (base_top - base_low) * frac)
-        else:
-            prob = 93
         st = statuses_map.get(p.id)
         if st and st.availability == "OUT":
-            # на случай если по ошибке попал — но мы исключаем выше
             result[p.id] = (False, 3, "OUT (injury)")
+            continue
+        # линейная интерполяция стартовых
+        if total > 1:
+            frac = idx / (total - 1)
+            prob = round(95 - (95 - 80) * frac)
         else:
-            result[p.id] = (True, prob, "Predicted starter 4-2-3-1")
+            prob = 92
+        result[p.id] = (True, prob, "Predicted starter 4-2-3-1")
 
-    # BENCH
     for p in bench:
         st = statuses_map.get(p.id)
         if st and st.availability == "OUT":
             result[p.id] = (False, 3, "OUT (injury)")
         else:
-            # простая базовая вероятность выхода в старт (не стартует) — 60
             result[p.id] = (False, 60, "Bench / rotation")
 
     return result
@@ -146,27 +171,25 @@ async def generate_baseline_predictions(match_id: int, team_id: int):
         statuses = st_res.scalars().all()
         latest_status = {}
         for s in statuses:
-            # первый OUT сохраняем, остальные игнор
+            # Просто первый встретившийся OUT фиксируем (для MVP)
             if s.player_id not in latest_status:
                 latest_status[s.player_id] = s
 
-        # Проставим линии
-        healthy_players = []
-        out_players = []
+        # Классификация + разделение health / out
+        healthy = []
+        out_list = []
         for p in players:
             p._line = classify_line(p)
             st = latest_status.get(p.id)
             if st and st.availability == "OUT":
-                out_players.append(p)
+                out_list.append(p)
             else:
-                healthy_players.append(p)
+                healthy.append(p)
 
-        # Формируем старт из здоровых
-        starters = distribute_starters(healthy_players)
+        starters = distribute_starters(healthy)
         starter_ids = {p.id for p in starters}
-        bench = [p for p in healthy_players if p.id not in starter_ids] + out_players
+        bench = [p for p in healthy if p.id not in starter_ids] + out_list
 
-        # Удаляем старые предикты
         await session.execute(delete(Prediction).where(Prediction.match_id == match_id))
         await session.flush()
 
@@ -181,5 +204,6 @@ async def generate_baseline_predictions(match_id: int, team_id: int):
                 probability=probability,
                 explanation=explanation
             ))
+
         await session.commit()
-        return f"Predictions generated (improved 4-2-3-1) starters={len(starters)}, total_players={len(players)}"
+        return f"Predictions generated (4-2-3-1 improved) starters={len(starters)}, total_players={len(players)}"
