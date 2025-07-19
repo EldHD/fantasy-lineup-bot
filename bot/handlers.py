@@ -24,7 +24,6 @@ TEAM_FORMATIONS = {
     "CSKA Moscow": ["4-3-3"],
 }
 
-# ---------- Утилиты схемы ----------
 def parse_formation(code: str):
     parts = [int(p) for p in code.split("-")]
     return {"code": code, "def": parts[0], "mid": sum(parts[1:-1]), "fwd": parts[-1]}
@@ -53,7 +52,6 @@ def classify_role(row, formation_meta):
     return "midfielder"
 
 
-# ---------- Команды ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(name, callback_data=f"league_{code}")] for name, code in LEAGUES]
     markup = InlineKeyboardMarkup(keyboard)
@@ -66,17 +64,18 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
 
 async def sync_roster_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /sync_roster  (или /sync_roster Arsenal,Chelsea)
-    if context.args:
-        team_names = " ".join(context.args).split(",")
-        team_names = [t.strip() for t in team_names if t.strip()]
-    else:
-        team_names = ["Arsenal", "Chelsea"]
-    rep = await sync_multiple_teams(team_names)
-    await update.message.reply_text(f"Roster sync:\n{rep}")
+    try:
+        if context.args:
+            team_names = " ".join(context.args).split(",")
+            team_names = [t.strip() for t in team_names if t.strip()]
+        else:
+            team_names = ["Arsenal", "Chelsea"]
+        rep = await sync_multiple_teams(team_names)
+        await update.message.reply_text(f"Roster sync:\n{rep}")
+    except Exception as e:
+        await update.message.reply_text(f"Roster sync failed: {e}")
 
 async def gen_demo_preds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /gen_demo_preds <match_id> <team_id>
     if len(context.args) < 2:
         await update.message.reply_text("Usage: /gen_demo_preds <match_id> <team_id>")
         return
@@ -89,10 +88,9 @@ async def gen_demo_preds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     rep = await generate_baseline_predictions(match_id, team_id)
     await update.message.reply_text(rep)
 
-# (опционально) /debugdb
 from sqlalchemy import select
 from bot.db.database import SessionLocal
-from bot.db.models import Tournament, Match, Team, Player
+from bot.db.models import Tournament, Match, Player
 
 async def debug_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with SessionLocal() as session:
@@ -114,7 +112,7 @@ async def debug_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = text[:3800] + "\n…truncated"
     await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
 
-# ---------- Навигация ----------
+
 async def back_to_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -302,7 +300,6 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
-# Catch-all (отладка)
 async def debug_catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         print("[CATCH-ALL] data =", update.callback_query.data)
