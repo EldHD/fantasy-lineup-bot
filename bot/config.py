@@ -1,14 +1,28 @@
 import os
-from datetime import timedelta
 
-# Включение / выключение планировщика
-ENABLE_SCHEDULER = os.environ.get("ENABLE_SCHEDULER", "0") == "1"
+# ---------- Интервалы и задержки для фоновых задач (JobQueue) ----------
+# Периодичность синка ростеров (в секундах). По умолчанию 6 часов.
+SYNC_INTERVAL_SEC = int(os.environ.get("SYNC_INTERVAL_SEC", str(6 * 60 * 60)))  # 21600
 
-# Интервалы (в минутах) – можно переопределить переменными окружения
-SYNC_INTERVAL_MIN = int(os.environ.get("SYNC_INTERVAL_MIN", "360"))      # 6h
-PREDICT_INTERVAL_MIN = int(os.environ.get("PREDICT_INTERVAL_MIN", "390"))  # 6h30m
+# Периодичность генерации предиктов (в секундах). По умолчанию 6ч + 10 минут.
+PREDICT_INTERVAL_SEC = int(os.environ.get("PREDICT_INTERVAL_SEC", str(6 * 60 * 60 + 600)))  # 22200
 
-# Список клубов EPL для синка (Transfermarkt ID – будет использоваться transfermarkt.py)
+# Задержка перед первым автоматическим синком (сек)
+FIRST_SYNC_DELAY = int(os.environ.get("FIRST_SYNC_DELAY", "10"))
+
+# Задержка перед первой автогенерацией предиктов (сек)
+FIRST_PREDICT_DELAY = int(os.environ.get("FIRST_PREDICT_DELAY", "40"))
+
+# Установи DISABLE_JOBS=1 в переменных окружения, если хочешь полностью отключить автозадачи.
+DISABLE_JOBS = os.environ.get("DISABLE_JOBS", "0") == "1"
+
+# ---------- Константы турнир / охват ----------
+EPL_TOURNAMENT_CODE = "epl"
+
+# Сколько дней вперёд генерировать предикты (для job_generate_predictions)
+PREDICT_DAYS_AHEAD = int(os.environ.get("PREDICT_DAYS_AHEAD", "7"))
+
+# Полный список команд EPL (поддерживаемый синк)
 EPL_TEAM_NAMES = [
     "Arsenal",
     "Aston Villa",
@@ -32,8 +46,7 @@ EPL_TEAM_NAMES = [
     "Wolverhampton Wanderers",
 ]
 
-# Какой турнир-код у нас в таблице tournament для АПЛ (созданный раньше)
-EPL_TOURNAMENT_CODE = "epl"
-
-# Ограничение – сколько дней вперёд генерировать предикты
-PREDICT_DAYS_AHEAD = int(os.environ.get("PREDICT_DAYS_AHEAD", "7"))
+# Можно позже добавить аналогичные списки для других лиг:
+# LALIGA_TEAM_NAMES = [...]
+# SERIEA_TEAM_NAMES = [...]
+# и т.д.
