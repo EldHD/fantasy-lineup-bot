@@ -17,36 +17,22 @@ LEAGUES = [
     ("Russian Premier League", "rpl"),
 ]
 
-# ---------- /start ----------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    keyboard = [
-        [InlineKeyboardButton("Выбрать чемпионат", callback_data="choose_league")],
-        [InlineKeyboardButton("Предсказать состав", callback_data="choose_league")]  # пока тот же шаг
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    if update.message:
-        await update.message.reply_text("Привет! Выберите действие:", reply_markup=reply_markup)
-    else:
-        await context.bot.send_message(chat_id=update.effective_chat.id,
-                                       text="Привет! Выберите действие:", reply_markup=reply_markup)
-
-# ---------- Выбор лиг ----------
-
-async def show_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+# ----- /start: сразу лиги -----
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton(name, callback_data=f"league_{code}")]
         for name, code in LEAGUES
     ]
-    await query.edit_message_text(
-        "Выберите лигу:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    if update.message:
+        await update.message.reply_text("Выберите лигу:", reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Выберите лигу:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
-# ---------- После выбора лиги: список матчей ----------
-
+# ----- Выбор лиги → список матчей -----
 async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -54,79 +40,80 @@ async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_
 
     matches = get_upcoming_matches(league_code)
     if not matches:
-        await query.edit_message_text(f"Пока нет матчей для лиги {league_code.upper()}")
+        buttons = [[InlineKeyboardButton("⬅ К лигам", callback_data="back_leagues")]]
+        await query.edit_message_text(f"Пока нет матчей для {league_code.upper()}",
+                                      reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     buttons = []
     for m in matches:
         txt = f"{m['home_team']['name']} vs {m['away_team']['name']} • {format_kickoff(m['utc_kickoff'])}"
         buttons.append([InlineKeyboardButton(txt, callback_data=f"match_{m['id']}")])
+    buttons.append([InlineKeyboardButton("⬅ К лигам", callback_data="back_leagues")])
 
-    buttons.append([InlineKeyboardButton("⬅ Назад к лигам", callback_data="choose_league")])
+    await query.edit_message_text(f"Матчи ({league_code.upper()}):",
+                                  reply_markup=InlineKeyboardMarkup(buttons))
 
-    await query.edit_message_text(
-        f"Матчи ({league_code.upper()}):",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+# ----- Назад к лигам -----
+async def back_to_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await start(update, context)
 
-# ---------- После выбора матча: выбрать команду ----------
-
+# ----- Выбор матча → выбор команды -----
 async def handle_match_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     match_id = query.data.split("_", 1)[1]
     match = get_match(match_id)
     if not match:
-        await query.edit_message_text("Матч не найден или устарел.")
+        await query.edit_message_text("Матч не найден (возможно устарел).",
+                                      reply_markup=InlineKeyboardMarkup(
+                                          [[InlineKeyboardButton("⬅ К лигам", callback_data="back_leagues")]]
+                                      ))
         return
 
     home, away = match["home_team"], match["away_team"]
-
     buttons = [
-        [InlineKeyboardButton(f"{home['name']}", callback_data=f"team_{match_id}_{home['code']}")],
-        [InlineKeyboardButton(f"{away['name']}", callback_data=f"team_{match_id}_{away['code']}")],
-        [InlineKeyboardButton("⬅ К матчам", callback_data=f"league_{match['league']}")]
+        [InlineKeyboardButton(home['name'], callback_data=f"team_{match_id}_{home['code']}")],
+        [InlineKeyboardButton(away['name'], callback_data=f"team_{match_id}_{away['code']}")],
+        [InlineKeyboardButton("⬅ К матчам", callback_data=f"league_{match['league']}")],
+        [InlineKeyboardButton("🏁 Лиги", callback_data="back_leagues")]
     ]
-
     header = (f"{home['name']} vs {away['name']}\n"
               f"{match['round']}\n"
               f"Kickoff: {format_kickoff(match['utc_kickoff'])}\n\nВыберите команду:")
 
     await query.edit_message_text(header, reply_markup=InlineKeyboardMarkup(buttons))
 
-# ---------- Предикт состава (заглушка) ----------
-
+# ----- Предикт состава (заглушка) -----
 async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # callback: team_<matchid>_<teamcode>
     parts = query.data.split("_", 2)
     if len(parts) < 3:
         await query.edit_message_text("Некорректный callback.")
         return
-    match_id = parts[1]
-    team_code = parts[2]
-
+    match_id, team_code = parts[1], parts[2]
     match = get_match(match_id)
     if not match:
-        await query.edit_message_text("Матч не найден.")
+        await query.edit_message_text("Матч не найден.",
+                                      reply_markup=InlineKeyboardMarkup(
+                                          [[InlineKeyboardButton("⬅ Лиги", callback_data="back_leagues")]]
+                                      ))
         return
-
     lineup = get_dummy_lineup(match_id, team_code)
-
-    lines = []
-    for p in lineup:
-        lines.append(f"{p['number']} {p['name']} — {p['position']} | {p['probability']}% | {p['reason']}")
-    text = (f"Предикт стартового состава для {team_code}:\n"
+    lines = [
+        f"{p['number']} {p['name']} — {p['position']} | {p['probability']}% | {p['reason']}"
+        for p in lineup
+    ]
+    text = (f"Предикт состава {team_code}:\n"
             f"{match['home_team']['name']} vs {match['away_team']['name']}\n"
             f"{match['round']} • {format_kickoff(match['utc_kickoff'])}\n\n" +
-            "\n".join(lines) +
-            "\n\n(Позже: добавим источники, статусы OUT и т.д.)")
-
+            "\n".join(lines))
     buttons = [
         [InlineKeyboardButton("⬅ Другая команда", callback_data=f"match_{match_id}")],
-        [InlineKeyboardButton("⬅ К матчам", callback_data=f"league_{match['league']}")],
-        [InlineKeyboardButton("🏁 Лиги", callback_data="choose_league")]
+        [InlineKeyboardButton("⬅ Матчи", callback_data=f"league_{match['league']}")],
+        [InlineKeyboardButton("🏁 Лиги", callback_data="back_leagues")]
     ]
-
-    await query.edit_message_text(text[:4000], reply_markup=InlineKeyboardMarkup(buttons))  # Telegram лимит
+    await query.edit_message_text(text[:4000], reply_markup=InlineKeyboardMarkup(buttons))
