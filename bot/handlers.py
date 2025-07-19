@@ -1,6 +1,10 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from bot.db.crud import fetch_matches_by_league, fetch_match_with_teams
+from bot.db.crud import (
+    fetch_matches_by_league,
+    fetch_match_with_teams,
+    fetch_team_lineup_predictions,
+)
 
 LEAGUES = [
     ("Premier League", "epl"),
@@ -11,7 +15,7 @@ LEAGUES = [
     ("Russian Premier League", "rpl"),
 ]
 
-# ----- /start: сразу показать лиги -----
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton(name, callback_data=f"league_{code}")]
@@ -24,13 +28,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=update.effective_chat.id,
                                        text="Выберите лигу:", reply_markup=markup)
 
-# ----- Назад к лигам -----
+
 async def back_to_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await start(update, context)
 
-# ----- Выбор лиги → список матчей из БД -----
+
 async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -57,7 +61,7 @@ async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
-# ----- Выбор матча → выбор команды -----
+
 async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -84,7 +88,7 @@ async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAUL
     )
     await query.edit_message_text(header, reply_markup=InlineKeyboardMarkup(buttons))
 
-# ----- Заглушка для состава: позже заменим на игроков из БД -----
+
 async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -92,19 +96,31 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
     if len(parts) < 3:
         await query.edit_message_text("Некорректный формат callback.")
         return
-    match_id = parts[1]
-    team_id = parts[2]
-    # Пока просто выводим заглушку
-    text = (
-        f"Состав (пока заглушка)\n"
-        f"match_id={match_id}, team_id={team_id}\n\n"
-        f"На следующем шаге подключим игроков и предикты."
-    )
+
+    match_id = int(parts[1])
+    team_id = int(parts[2])
+
+    preds = await fetch_team_lineup_predictions(match_id, team_id)
+    if not preds:
+        await query.edit_message_text("Нет предиктов для этой команды (пока).",
+                                      reply_markup=InlineKeyboardMarkup(
+                                          [[InlineKeyboardButton("⬅ Назад", callback_data=f"matchdb_{match_id}")]]
+                                      ))
+        return
+
+    lines = []
+    for pr in preds:
+        p = pr.player
+        pos = p.position_detail or p.position_main
+        status = "START" if pr.will_start else "OUT"
+        lines.append(
+            f"{p.shirt_number or '-'} {p.full_name} — {pos} | {status} | {pr.probability}%\n"
+            f"  {pr.explanation}"
+        )
+
+    text = "Предикт стартового состава:\n\n" + "\n".join(lines)
     buttons = [
-        [InlineKeyboardButton("⬅ Назад к матчу", callback_data=f"matchdb_{match_id}")],
+        [InlineKeyboardButton("⬅ Другая команда", callback_data=f"matchdb_{match_id}")],
         [InlineKeyboardButton("🏁 Лиги", callback_data="back_leagues")]
     ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-
-# Переименовали для main.py
-handle_team_selection = handle_team_selection
+    await query.edit_message_text(text[:3900], reply_markup=InlineKeyboardMarkup(buttons))
