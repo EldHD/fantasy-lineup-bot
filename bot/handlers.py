@@ -1,15 +1,20 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import ContextTypes
 from bot.db.crud import (
     fetch_matches_by_league,
     fetch_match_with_teams,
     fetch_team_lineup_predictions,
 )
-from bot.services.roster import sync_multiple_teams
+from bot.services.roster import sync_multiple_teams, ensure_teams_exist
 from bot.services.predictions import generate_baseline_predictions
+from bot.config import EPL_TEAM_NAMES
 from sqlalchemy import select
 from bot.db.database import SessionLocal
-from bot.db.models import Tournament, Match, Player
+from bot.db.models import Tournament, Match, Player, Team, Prediction, PlayerStatus
+import io
+import csv
+from datetime import datetime
+
 
 LEAGUES = [
     ("Premier League", "epl"),
@@ -47,6 +52,12 @@ async def sync_roster_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Roster sync failed: {e}")
 
 
+async def resync_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Полный синк всех EPL команд."""
+    await ensure_teams_exist(EPL_TEAM_NAMES, tournament_code="epl")
+    rep = await sync_multiple_teams(EPL_TEAM_NAMES)
+    await update.message.reply_text(f"EPL full sync:\n{rep[:3500]}")
+
 async def gen_demo_preds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
         await update.message.reply_text("Usage: /gen_demo_preds <match_id> <team_id>")
@@ -59,6 +70,88 @@ async def gen_demo_preds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     rep = await generate_baseline_predictions(match_id, team_id)
     await update.message.reply_text(rep)
+
+
+async def export_lineup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /export_lineup <match_id> <team_id> [csv|md]
+    Экспорт старт/OUT/bench в таблицу.
+    """
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /export_lineup <match_id> <team_id> [csv|md]")
+        return
+    try:
+        match_id = int(context.args[0])
+        team_id = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("IDs must be integers.")
+        return
+    fmt = "csv"
+    if len(context.args) >= 3:
+        fmt = context.args[2].lower()
+        if fmt not in ("csv", "md"):
+            fmt = "csv"
+
+    rows = await fetch_team_lineup_predictions(match_id, team_id)
+    if not rows:
+        await update.message.reply_text("Нет данных предикта.")
+        return
+
+    # Найдём матч и команду
+    async with SessionLocal() as session:
+        m_res = await session.execute(select(Match).where(Match.id == match_id))
+        match = m_res.scalar_one_or_none()
+        t_res = await session.execute(select(Team).where(Team.id == team_id))
+        team = t_res.scalar_one_or_none()
+    match_label = f"{match.home_team_id} vs {match.away_team_id}" if match else f"match {match_id}"
+    team_name = team.name if team else f"team {team_id}"
+
+    # Преобразуем в упрощённый вид
+    starters = [r for r in rows if r["will_start"] and r["status_availability"] != "OUT"]
+    out_players = [r for r in rows if r["status_availability"] == "OUT"]
+    bench = [r for r in rows if not r["will_start"] and r["status_availability"] != "OUT"]
+
+    def simple_row(block_type, r):
+        return {
+            "match_id": match_id,
+            "team_id": team_id,
+            "team": team_name,
+            "player": r["full_name"],
+            "number": r["number"] or "",
+            "position": r["position_detail"] or r["position_main"],
+            "category": block_type,  # START / OUT / BENCH
+            "probability": r["probability"],
+            "reason": r["status_reason"] or r["explanation"] or ""
+        }
+
+    export_rows = (
+        [simple_row("START", r) for r in starters[:11]] +
+        [simple_row("OUT", r) for r in out_players] +
+        [simple_row("BENCH", r) for r in bench]
+    )
+
+    if fmt == "csv":
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=list(export_rows[0].keys()))
+        writer.writeheader()
+        for er in export_rows:
+            writer.writerow(er)
+        data = buf.getvalue().encode("utf-8")
+        bio = io.BytesIO(data)
+        bio.name = f"lineup_{match_id}_{team_id}.csv"
+        await update.message.reply_document(document=bio, caption=f"Export CSV: {team_name}")
+    else:
+        # Markdown таблица
+        headers = list(export_rows[0].keys())
+        md_lines = []
+        md_lines.append("| " + " | ".join(headers) + " |")
+        md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+        for er in export_rows:
+            md_lines.append("| " + " | ".join(str(er[h]) for h in headers) + " |")
+        text = f"**Lineup Export** `{team_name}` / match {match_id}\n" + "\n".join(md_lines)
+        if len(text) > 3900:
+            text = text[:3900] + "\n… truncated"
+        await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def debug_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -81,6 +174,8 @@ async def debug_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = text[:3800] + "\n…truncated"
     await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
 
+
+# Навигационные (оставляем прежние ниже) ----------------
 
 async def back_to_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -114,7 +209,7 @@ async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_
         )
     except Exception:
         await query.edit_message_text(
-            f"Произошла ошибка при загрузке матчей для {league_code.upper()} :(",
+            f"Ошибка при загрузке матчей {league_code.upper()}",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ К лигам", callback_data="back_leagues")]])
         )
 
@@ -144,6 +239,7 @@ async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAUL
     await query.edit_message_text(header, reply_markup=InlineKeyboardMarkup(buttons))
 
 
+# Из предыдущей версии – упрощённый вывод состава (можно оставить 4 линии, но экспорт есть отдельно)
 def _line_group_tag(r):
     d = (r["position_detail"] or "").upper()
     pm = r["position_main"]
@@ -201,7 +297,6 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     formation_code = "4-2-3-1"
-
     raw_starters = [r for r in rows if r["will_start"] and r["status_availability"] != "OUT"]
     raw_starters.sort(key=lambda r: -r["probability"])
     starters = raw_starters[:11]
@@ -241,7 +336,9 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
         out_text,
         "",
         "🔁 **Скамейка / ротация**:",
-        bench_text
+        bench_text,
+        "",
+        "_/export_lineup {} {} md или csv для экспорта_".format(match_id, team_id)
     ]
     text = "\n".join(lines)
     if len(text) > 3900:
