@@ -1,86 +1,85 @@
-import os
+import asyncio
 import logging
+import os
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler
 )
 
+from bot.config import BOT_TOKEN, SYNC_INTERVAL_SEC, PREDICT_INTERVAL_SEC
 from bot.handlers import (
-    start,
-    ping,
-    sync_roster_cmd,
-    resync_all_cmd,
-    gen_demo_preds_cmd,
-    export_lineup_cmd,
+    start_cmd,
     handle_league_selection,
-    handle_db_match_selection,
+    handle_match_selection,
     handle_team_selection,
     back_to_leagues,
-    debug_db,
+    back_to_matches,
+    resync_all_cmd,
+    sync_roster_cmd,
+    modules_cmd,       # опционально /modules
 )
-from bot.services.job_tasks import schedule_jobs
-from bot.config import (
-    SYNC_INTERVAL_SEC,
-    PREDICT_INTERVAL_SEC,
-    FIRST_SYNC_DELAY,
-    FIRST_PREDICT_DELAY,
-    DISABLE_JOBS,
+from bot.services.job_tasks import (
+    job_sync_rosters,
+    job_generate_predictions,
 )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s"
+)
 logger = logging.getLogger(__name__)
 
 
-def _get_bot_token():
-    for key in ("BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN"):
-        val = os.environ.get(key)
-        if val:
-            logger.info("Using bot token from env var: %s", key)
-            return val
-    return None
+def build_application():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN not set (need TELEGRAM_TOKEN env var)")
 
+    logger.info("Using bot token from env var: TELEGRAM_TOKEN")
 
-def build_app(bot_token: str):
-    app = ApplicationBuilder().token(bot_token).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("sync_roster", sync_roster_cmd))
+    # Команды
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("resync_all", resync_all_cmd))
-    app.add_handler(CommandHandler("gen_demo_preds", gen_demo_preds_cmd))
-    app.add_handler(CommandHandler("export_lineup", export_lineup_cmd))
-    app.add_handler(CommandHandler("debugdb", debug_db))
+    app.add_handler(CommandHandler("sync_roster", sync_roster_cmd))
+    app.add_handler(CommandHandler("modules", modules_cmd))
 
-    # Callback query handlers
-    app.add_handler(CallbackQueryHandler(back_to_leagues, pattern="^back_leagues$"))
-    app.add_handler(CallbackQueryHandler(handle_league_selection, pattern="^league_"))
-    app.add_handler(CallbackQueryHandler(handle_db_match_selection, pattern="^matchdb_"))
-    app.add_handler(CallbackQueryHandler(handle_team_selection, pattern="^teamdb_"))
+    # CallbackQuery
+    app.add_handler(CallbackQueryHandler(handle_league_selection, pattern=r"^league:"))
+    app.add_handler(CallbackQueryHandler(handle_match_selection, pattern=r"^match:"))
+    app.add_handler(CallbackQueryHandler(handle_team_selection, pattern=r"^team:"))
+    app.add_handler(CallbackQueryHandler(back_to_leagues, pattern=r"^back:leagues$"))
+    app.add_handler(CallbackQueryHandler(back_to_matches, pattern=r"^back:matches:"))
 
+    # Планирование через JobQueue (БЕЗ APScheduler)
+    jq = app.job_queue
+
+    # Добавим начальный однократный запуск слегка отложенный
+    jq.run_once(job_sync_rosters, when=10)
+
+    # Периодические
+    jq.run_repeating(
+        job_sync_rosters,
+        interval=SYNC_INTERVAL_SEC,
+        first=SYNC_INTERVAL_SEC + 30,  # чтобы не совпало с началом
+        name="sync_rosters"
+    )
+    jq.run_repeating(
+        job_generate_predictions,
+        interval=PREDICT_INTERVAL_SEC,
+        first=PREDICT_INTERVAL_SEC + 40,
+        name="generate_predictions"
+    )
+    logger.info(
+        "JobQueue tasks scheduled: sync=%ss predict=%ss",
+        SYNC_INTERVAL_SEC, PREDICT_INTERVAL_SEC
+    )
     return app
 
 
 def main():
-    token = _get_bot_token()
-    if not token:
-        raise RuntimeError("BOT_TOKEN / TELEGRAM_TOKEN not set")
-
-    app = build_app(token)
-
-    # Подключаем задачи JobQueue (вместо старого APScheduler)
-    schedule_jobs(
-        app.job_queue,
-        sync_interval_sec=SYNC_INTERVAL_SEC,
-        predict_interval_sec=PREDICT_INTERVAL_SEC,
-        first_sync_delay=FIRST_SYNC_DELAY,
-        first_predict_delay=FIRST_PREDICT_DELAY,
-        disabled=DISABLE_JOBS
-    )
-
+    app = build_application()
     logger.info("Bot starting polling...")
-    app.run_polling()
+    app.run_polling(close_loop=False)  # PTB сам управляет loop
 
 
 if __name__ == "__main__":
