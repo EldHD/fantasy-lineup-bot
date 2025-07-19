@@ -12,10 +12,13 @@ from bot.handlers import (
     back_to_leagues,
     ping,
     debug_catch_all,
+    sync_roster_cmd,
+    gen_demo_preds_cmd,
+    debug_db,
 )
 from bot.db.seed import auto_seed
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]
+TOKEN = os.environ["TELEGRAM_TOKEN"]  # проверь название переменной
 
 
 async def post_init(app: Application):
@@ -55,15 +58,16 @@ def main():
     # Команды
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("ping", ping))
+    application.add_handler(CommandHandler("sync_roster", sync_roster_cmd))
+    application.add_handler(CommandHandler("gen_demo_preds", gen_demo_preds_cmd))
+    application.add_handler(CommandHandler("debugdb", debug_db))
 
-    # Callback-и по паттернам
+    # Callback-и
     application.add_handler(CallbackQueryHandler(back_to_leagues, pattern=r"^back_leagues$"))
     application.add_handler(CallbackQueryHandler(handle_league_selection, pattern=r"^league_"))
     application.add_handler(CallbackQueryHandler(handle_db_match_selection, pattern=r"^matchdb_"))
     application.add_handler(CallbackQueryHandler(handle_team_selection, pattern=r"^teamdb_"))
-
-    # Catch-all (ставим ПОСЛЕ специфичных)
-    application.add_handler(CallbackQueryHandler(debug_catch_all))
+    application.add_handler(CallbackQueryHandler(debug_catch_all))  # должен идти последним
 
     application.add_error_handler(error_handler)
 
