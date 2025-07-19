@@ -10,48 +10,49 @@ from bot.handlers import (
     handle_db_match_selection,
     handle_team_selection,
     back_to_leagues,
-    force_seed_cmd, 
+    force_seed_cmd,  # команда для пересоздания игроков/предиктов (опционально)
 )
 from bot.db.seed import auto_seed
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]  # проверь, что переменная есть в Railway
+TOKEN = os.environ["TELEGRAM_TOKEN"]  # переменная должна быть в Railway
+# DATABASE_URL также в переменных окружения
 
 
-async def post_init(application):
-    # 1. Чистим webhook, чтобы polling начал получать апдейты
+async def post_init(app: Application):
+    # Чистим webhook на всякий случай, чтобы polling работал
     try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        print("Webhook cleared (drop_pending_updates=True).")
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        print("Webhook cleared.")
     except Exception as e:
         print("Webhook clear error:", e)
 
-    # 2. Автосид (только если пусто)
+    # Создаём таблицы и, если нужно, сидируем
     await auto_seed()
-    print("DB init/seed done.")
+    print("DB init / seed complete.")
 
 
 def main():
     application = (
         Application.builder()
         .token(TOKEN)
-        .post_init(post_init)  # вызовется автоматически перед стартом polling
+        .post_init(post_init)
         .build()
     )
 
-    # Регистрируем handlers
+    # Команды
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("force_seed", force_seed_cmd))
+    application.add_handler(CommandHandler("force_seed", force_seed_cmd))  # опционально
+
+    # Callback-и
     application.add_handler(CallbackQueryHandler(back_to_leagues, pattern=r"^back_leagues$"))
     application.add_handler(CallbackQueryHandler(handle_league_selection, pattern=r"^league_"))
     application.add_handler(CallbackQueryHandler(handle_db_match_selection, pattern=r"^matchdb_"))
     application.add_handler(CallbackQueryHandler(handle_team_selection, pattern=r"^teamdb_"))
 
-    print("Starting bot (run_polling)...")
-    # drop_pending_updates на случай, если накопились старые апдейты
+    print("Starting bot (polling)...")
     application.run_polling(
         allowed_updates=None,
         drop_pending_updates=True,
-        stop_signals=None,   # Railway корректно завершит контейнер сам
     )
 
 
