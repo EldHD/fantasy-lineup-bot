@@ -2,13 +2,7 @@ import datetime as dt
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from .database import SessionLocal
-from .models import (
-    Tournament,
-    Match,
-    Prediction,
-    PlayerStatus,
-    Player,
-)
+from .models import Tournament, Match, Prediction, PlayerStatus, Player
 
 
 async def fetch_matches_by_league(code: str, limit: int = 10):
@@ -95,7 +89,7 @@ async def fetch_team_lineup_predictions(match_id: int, team_id: int):
         statuses_list = st_res.scalars().all()
         status_map = {}
         for st in statuses_list:
-            if st.player_id not in status_map:
+            if st.player_id not in status_map:  # берём самый свежий
                 status_map[st.player_id] = st
 
         order = {"goalkeeper": 0, "defender": 1, "midfielder": 2, "forward": 3}
