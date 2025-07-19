@@ -1,23 +1,23 @@
 import os
 import logging
-import asyncio
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
 )
+
 from bot.handlers import (
     start,
     ping,
     sync_roster_cmd,
+    resync_all_cmd,
     gen_demo_preds_cmd,
+    export_lineup_cmd,
     handle_league_selection,
     handle_db_match_selection,
     handle_team_selection,
     back_to_leagues,
     debug_db,
-    resync_all_cmd,
-    export_lineup_cmd,
 )
 from bot.services.scheduler import start_scheduler
 from bot.config import ENABLE_SCHEDULER
@@ -25,11 +25,22 @@ from bot.config import ENABLE_SCHEDULER
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
+def _get_bot_token():
+    """
+    Ищем токен в нескольких ключах, чтобы не путаться.
+    Приоритет: BOT_TOKEN > TELEGRAM_BOT_TOKEN > TELEGRAM_TOKEN
+    """
+    for key in ("BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN"):
+        val = os.environ.get(key)
+        if val:
+            logger.info("Using bot token from env var: %s", key)
+            return val
+    return None
 
 
-def build_app():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+def build_app(bot_token: str):
+    app = ApplicationBuilder().token(bot_token).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start))
@@ -50,14 +61,20 @@ def build_app():
 
 
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN not set")
-    app = build_app()
+    token = _get_bot_token()
+    if not token:
+        env_keys_preview = ", ".join(sorted(list(os.environ.keys())[:25]))
+        logger.error("BOT_TOKEN not set. First 25 env keys: %s", env_keys_preview)
+        raise RuntimeError("BOT_TOKEN / TELEGRAM_TOKEN not set")
+
+    app = build_app(token)
     scheduler = start_scheduler()
     if ENABLE_SCHEDULER:
         logger.info("Scheduler enabled.")
     else:
         logger.info("Scheduler disabled (set ENABLE_SCHEDULER=1 to enable).")
+
+    logger.info("Bot starting polling...")
     app.run_polling()
 
 
