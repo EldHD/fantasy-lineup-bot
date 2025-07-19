@@ -14,6 +14,7 @@ from bot.external.transfermarkt import (
 )
 import os
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -60,14 +61,36 @@ def _detail_sofa(p: dict):
     return mapping.get(desc, desc[:12]) if desc else None
 
 
+def generate_team_code(name: str, occupied: set) -> str:
+    """
+    Делает slug: только a-z0-9 и '_', режет до 32 символов.
+    Обеспечивает уникальность (добавляет -2, -3 ...).
+    """
+    base = name.lower()
+    base = re.sub(r'[^a-z0-9]+', '_', base)
+    base = re.sub(r'_+', '_', base).strip('_')
+    if not base:
+        base = "team"
+    base = base[:32]
+
+    code = base
+    counter = 2
+    while code in occupied:
+        suffix = f"_{counter}"
+        max_len = 32 - len(suffix)
+        code = base[:max_len] + suffix
+        counter += 1
+    occupied.add(code)
+    return code
+
+
 # ---------------- Ensure Teams ---------------- #
 
 async def ensure_teams_exist(team_names: List[str], tournament_code: str):
     """
-    Создаёт недостающие команды, привязывает к турниру.
-    Если турнир отсутствует – создаёт.
-    Если существующая команда без tournament_id – дополняем.
-    Возвращает: количество новых созданных команд.
+    Создаёт недостающие команды, привязывает к турниру и гарантирует code != NULL.
+    Также чинит (repair) команды без кода.
+    Возвращает: количество *новых* команд.
     """
     async with SessionLocal() as session:
         # Турнир
@@ -79,26 +102,47 @@ async def ensure_teams_exist(team_names: List[str], tournament_code: str):
             await session.flush()
             logger.info("Created tournament %s (id=%s)", tournament_code, tournament.id)
 
-        # Существующие команды
+        # Все команды этого турнира + те, что по именам (чтобы найти «старые» без турнира)
         existing_res = await session.execute(select(Team).where(Team.name.in_(team_names)))
-        existing = existing_res.scalars().all()
-        existing_by_name = {t.name: t for t in existing}
+        existing_all = existing_res.scalars().all()
+        existing_by_name = {t.name: t for t in existing_all}
+
+        # Собираем занятые коды (не только для этих команд), чтобы избежать коллизий
+        all_team_res = await session.execute(select(Team))
+        all_teams = all_team_res.scalars().all()
+        occupied_codes = {t.code for t in all_teams if getattr(t, "code", None)}
 
         created = 0
-        repaired = 0
+        repaired_code = 0
+        repaired_tournament = 0
+
         for name in team_names:
             team = existing_by_name.get(name)
             if team:
+                # repair tournament_id
                 if getattr(team, "tournament_id", None) in (None, 0):
                     team.tournament_id = tournament.id
-                    repaired += 1
+                    repaired_tournament += 1
+                # repair code
+                if not getattr(team, "code", None):
+                    team.code = generate_team_code(team.name, occupied_codes)
+                    repaired_code += 1
             else:
-                session.add(Team(name=name, tournament_id=tournament.id))
+                code = generate_team_code(name, occupied_codes)
+                new_team = Team(
+                    name=name,
+                    code=code,
+                    tournament_id=tournament.id
+                )
+                session.add(new_team)
                 created += 1
 
-        if created or repaired:
+        if created or repaired_code or repaired_tournament:
             await session.commit()
-            logger.info("Teams ensure: created=%s repaired=%s", created, repaired)
+            logger.info(
+                "Teams ensure: created=%s repaired_code=%s repaired_tournament=%s",
+                created, repaired_code, repaired_tournament
+            )
 
         return created
 
@@ -213,8 +257,7 @@ async def _sync_from_transfermarkt(team) -> str:
 
 async def sync_team_roster(team_name: str):
     """
-    Синхронизация одной команды: сначала Sofascore (если есть и не отключено),
-    затем Transfermarkt для уточнения + статусы.
+    Синхронизация одной команды: Sofascore (если не отключено) -> Transfermarkt.
     """
     async with SessionLocal() as session:
         stmt = select(Team).where(Team.name == team_name)
@@ -223,7 +266,7 @@ async def sync_team_roster(team_name: str):
         if not team:
             return f"Team '{team_name}' not found."
 
-    # Sofascore (если разрешено)
+    # Sofascore
     if not DISABLE_SOFA and team_name in SOFASCORE_TEAM_IDS:
         try:
             return f"{team_name} (Sofa): " + await _sync_from_sofascore(team)
