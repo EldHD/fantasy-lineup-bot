@@ -5,6 +5,7 @@ import time
 
 BASE_URL = "https://api.sofascore.com/api/v1"
 
+# Карта Sofascore ID команд, с которых начинаем
 SOFASCORE_TEAM_IDS = {
     "Arsenal": 42,
     "Chelsea": 38,
@@ -18,7 +19,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
 ]
 
-DEFAULT_HEADERS_BASE = {
+BASE_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Connection": "keep-alive",
     "Accept-Language": "en-US,en;q=0.9",
@@ -27,70 +28,77 @@ DEFAULT_HEADERS_BASE = {
 }
 
 class SofascoreError(Exception):
+    """Кастомная ошибка для единой обработки."""
     pass
 
 
-async def _get_json(url: str, max_retries: int = 3, backoff: float = 1.2):
+async def _fetch_json(url: str, max_retries: int = 3, backoff: float = 1.2):
     """
-    Универсальный GET с ретраями и случайным User-Agent.
+    Универсальный GET c ретраями и случайным User-Agent.
+    Без http2 — чтобы не требовалась установка h2.
     """
-    # Корректный timeout: либо один total, либо все 4 параметра.
-    timeout = httpx.Timeout(connect=8.0, read=12.0, write=12.0, pool=8.0)
+    # Простой общий таймаут
+    timeout = 15.0
 
+    last_exc = None
     for attempt in range(1, max_retries + 1):
-        headers = dict(DEFAULT_HEADERS_BASE)
+        headers = dict(BASE_HEADERS)
         headers["User-Agent"] = random.choice(USER_AGENTS)
-        async with httpx.AsyncClient(timeout=timeout, headers=headers, http2=True) as client:
+
+        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
             try:
-                r = await client.get(url)
+                resp = await client.get(url)
             except httpx.RequestError as e:
-                if attempt == max_retries:
-                    raise SofascoreError(f"Network error after {attempt} attempts: {e}") from e
-                await asyncio.sleep(backoff * attempt)
-                continue
+                last_exc = SofascoreError(f"Network error attempt {attempt}: {e}")
+            else:
+                if resp.status_code == 200:
+                    try:
+                        return resp.json()
+                    except ValueError as ve:
+                        raise SofascoreError("Invalid JSON in Sofascore response") from ve
 
-        if r.status_code == 200:
-            try:
-                return r.json()
-            except ValueError as e:
-                raise SofascoreError("Invalid JSON from Sofascore") from e
+                # Антибот / лимиты — можно попробовать повторить
+                if resp.status_code in (403, 429, 503):
+                    last_exc = SofascoreError(
+                        f"HTTP {resp.status_code} (anti-bot/limit) attempt {attempt}; snippet={resp.text[:100].replace(chr(10),' ')}"
+                    )
+                else:
+                    # Прочие коды — не ретраим
+                    raise SofascoreError(
+                        f"HTTP {resp.status_code} {resp.text[:120].replace(chr(10),' ')}"
+                    )
 
-        if r.status_code in (403, 429, 503):
-            # антибот или много запросов — попробуем подождать и сменить UA
-            if attempt == max_retries:
-                snippet = r.text[:120].replace("\n", " ")
-                raise SofascoreError(f"HTTP {r.status_code} (anti-bot?) {snippet}")
-            await asyncio.sleep(backoff * attempt + random.uniform(0, 0.5))
-            continue
+        if attempt < max_retries:
+            await asyncio.sleep(backoff * attempt + random.uniform(0, 0.4))
 
-        # другие коды — нет смысла ретраить (чаще 404)
-        snippet = r.text[:120].replace("\n", " ")
-        raise SofascoreError(f"HTTP {r.status_code} {snippet}")
-
-    # Теоретически сюда не дойдём
-    raise SofascoreError("Unreachable state in _get_json")
+    # Все попытки исчерпаны
+    if last_exc:
+        raise last_exc
+    raise SofascoreError("Unknown fetch error (no response, no exception?)")
 
 
 async def fetch_team_players(sofa_team_id: int):
     """
-    Возвращает список игроков команды с Sofascore.
+    Возвращает список игроков для команды Sofascore.
+    Поднимает SofascoreError при проблеме.
     """
     url = f"{BASE_URL}/team/{sofa_team_id}/players"
-    data = await _get_json(url)
+    data = await _fetch_json(url)
     players = data.get("players")
     if players is None:
-        raise SofascoreError("Field 'players' missing in Sofascore response")
+        raise SofascoreError("Field 'players' missing in Sofascore JSON")
     return players
 
 
+# Локальный быстрый тест
 if __name__ == "__main__":
     async def _t():
         try:
             st = time.time()
-            ps = await fetch_team_players(42)
-            print("Count:", len(ps), "elapsed", round(time.time() - st, 2), "s")
-            if ps:
-                print(ps[0])
+            players = await fetch_team_players(42)
+            print("Count:", len(players), "Time:", round(time.time() - st, 2), "s")
+            if players:
+                print(players[0])
         except Exception as e:
-            print("ERR:", e)
+            print("TEST ERROR:", e)
     asyncio.run(_t())
