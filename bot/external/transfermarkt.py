@@ -102,41 +102,28 @@ def _map_detail(raw: str):
 
 
 def _extract_position_from_row(row) -> str:
-    """
-    У Transfermarkt каждая строка содержит внутреннюю таблицу с позициями.
-    Ищем td с классом 'zentriert' рядом с мини-таблицей.
-    """
-    # Попытка 1: внутренний список позиций
-    pos_cell = None
-    # иногда класс 'inline-table' внутри
     inline_tbl = row.css_first("table.inline-table")
     if inline_tbl:
-        # позиция часто во второй строке body
         text_chunks = []
         for td in inline_tbl.css("td"):
             t = _clean(td.text())
             if t and not re.search(r'^\d+$', t):
                 text_chunks.append(t)
         if text_chunks:
-            # Берём последний как самый специфичный (обычно конкретная роль)
             return text_chunks[-1]
-
-    # Попытка 2: взять 5-й или 6-й столбец
     tds = row.css("td")
     for idx_guess in (4, 5, 6):
         if idx_guess < len(tds):
             guess_text = _clean(tds[idx_guess].text())
             if any(k in guess_text.lower() for k in ["midfield", "back", "wing", "forward", "striker", "keeper"]):
                 return guess_text
-
-    return ""  # fallback
+    return ""
 
 
 async def fetch_team_squad(team_name: str):
     team_id = TRANSFERMARKT_TEAM_IDS.get(team_name)
     if not team_id:
         raise TMError(f"No Transfermarkt ID for {team_name}")
-
     url = f"https://www.transfermarkt.com/-/kader/verein/{team_id}/saison_id/{CURRENT_SEASON}/plus/1"
     html = await _fetch(url)
     parser = HTMLParser(html)
@@ -149,28 +136,22 @@ async def fetch_team_squad(team_name: str):
         tds = row.css("td")
         if len(tds) < 2:
             continue
-        # Shirt number
         number = _parse_shirt_number(tds[0].text())
-        # Name
         link = row.css_first("td a")
         full_name = _clean(link.text()) if link else _clean(row.text())
         if not full_name or len(full_name) < 2:
             continue
-
         pos_detail_raw = _extract_position_from_row(row)
         position_main = _map_main(pos_detail_raw or "")
         position_detail = _map_detail(pos_detail_raw) if pos_detail_raw else None
-
         players.append({
             "full_name": full_name,
             "shirt_number": number,
             "position_main": position_main,
             "position_detail": position_detail
         })
-
     if not players:
         raise TMError("No players parsed")
-
     return players
 
 
@@ -194,13 +175,13 @@ async def fetch_injury_list(team_name: str):
             continue
         name_link = row.css_first("td a")
         full_name = _clean(name_link.text()) if name_link else _clean(row.text())
-        reason_cell = tds[2].text() if len(tds) > 2 else ""
+        reason_cell = tds[1].text() if len(tds) > 1 else ""  # <-- фикс индекса
         reason = _clean(reason_cell)
         if full_name:
             out_list.append({
                 "full_name": full_name,
                 "availability": "OUT",
-                "reason": reason
+                "reason": reason or "Unavailable",
             })
     return out_list
 
