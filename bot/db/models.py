@@ -49,7 +49,7 @@ class Match(Base):
     tournament_id: Mapped[int] = mapped_column(ForeignKey("tournaments.id", ondelete="CASCADE"), index=True)
     round: Mapped[str] = mapped_column(String(50))
     utc_kickoff: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), index=True)
-    home_team_id: Mapped[int] = mapped_column(ForeKey := ForeignKey("teams.id", ondelete="CASCADE"), index=True)
+    home_team_id: Mapped[int] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), index=True)
     away_team_id: Mapped[int] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), index=True)
 
     tournament: Mapped["Tournament"] = relationship(back_populates="matches")
@@ -101,8 +101,8 @@ class PlayerStatus(Base):
     __tablename__ = "player_status"
     id: Mapped[int] = mapped_column(primary_key=True)
     player_id: Mapped[int] = mapped_column(ForeignKey("players.id", ondelete="CASCADE"), index=True)
-    type: Mapped[str] = mapped_column(String(40))           # injury / suspension / etc.
-    availability: Mapped[str] = mapped_column(String(10))   # OK / OUT / DOUBT
+    type: Mapped[str] = mapped_column(String(40))
+    availability: Mapped[str] = mapped_column(String(10))
     reason: Mapped[Optional[str]] = mapped_column(String(200))
     raw_status: Mapped[Optional[str]] = mapped_column(Text)
     expected_return: Mapped[Optional[dt.date]] = mapped_column(nullable=True)
