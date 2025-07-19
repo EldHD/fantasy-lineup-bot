@@ -5,8 +5,7 @@ from bot.db.crud import (
     fetch_match_with_teams,
     fetch_team_lineup_predictions,
 )
-from bot.db.seed import force_players_reset  # оставь, если используешь /force_seed
-
+from bot.db.seed import force_players_reset  # /force_seed (можно убрать при желании)
 
 LEAGUES = [
     ("Premier League", "epl"),
@@ -100,7 +99,7 @@ async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAUL
     await query.edit_message_text(header, reply_markup=InlineKeyboardMarkup(buttons))
 
 
-# ----- Команда → предикт состава -----
+# ----- Команда → предикт состава с логикой 11 / OUT / потенциальные -----
 async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -122,47 +121,94 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    starters = []
-    out_or_doubt = []
+    # --- Группы по доступности ---
+    out_players = [r for r in rows if r["status_availability"] == "OUT"]
+    doubt_players = [r for r in rows if r["status_availability"] == "DOUBT"]
+    ok_players = [r for r in rows if r["status_availability"] in (None, "OK")]
 
-    for r in rows:
+    pos_order = {"goalkeeper": 0, "defender": 1, "midfielder": 2, "forward": 3}
+
+    def sort_key(r):
+        return (
+            pos_order.get(r["position_main"], 99),
+            -r["probability"],
+            r["full_name"].lower()
+        )
+
+    ok_players.sort(key=sort_key)
+    doubt_players.sort(key=sort_key)
+    out_players.sort(key=sort_key)
+
+    # --- Формирование старта ---
+    starters = ok_players[:11]
+    if len(starters) < 11:
+        need = 11 - len(starters)
+        starters.extend(doubt_players[:need])
+
+    starter_ids = {r["player_id"] for r in starters}
+
+    # --- Потенциальные (скамейка/ротация) ---
+    potential = []
+    # Остатки OK
+    for r in ok_players[11:]:
+        if r["player_id"] not in starter_ids:
+            potential.append(r)
+    # Оставшиеся DOUBT
+    for r in doubt_players:
+        if r["player_id"] not in starter_ids:
+            potential.append(r)
+
+    potential.sort(key=sort_key)
+
+    # --- Форматирование строк ---
+    def fmt_line(r, in_start=False):
         pos = r["position_detail"] or r["position_main"]
-        availability_tag = ""
+        tags = []
         if r["status_availability"] == "OUT":
-            availability_tag = "❌ OUT"
+            tags.append("❌ OUT")
         elif r["status_availability"] == "DOUBT":
-            availability_tag = "❓ Doubt"
-
+            tags.append("❓ Doubt")
+            if in_start:
+                tags.append("(* риск)")
         line = f"{r['number'] or '-'} {r['full_name']} — {pos} | {r['probability']}%"
-        if availability_tag:
-            line += f" | {availability_tag}"
+        if tags:
+            line += " | " + " ".join(tags)
 
         explain_parts = []
         if r["explanation"]:
             explain_parts.append(r["explanation"])
         if r["status_reason"]:
             explain_parts.append(r["status_reason"])
-        explain = "; ".join(explain_parts)
-        if explain:
-            line += "\n  " + explain
+        if explain_parts:
+            line += "\n  " + "; ".join(explain_parts)
+        return line
 
-        if r["status_availability"] in ("OUT", "DOUBT"):
-            out_or_doubt.append(line)
-        else:
-            starters.append(line)
+    starters_formatted = [fmt_line(r, in_start=True) for r in starters]
+    out_formatted = [fmt_line(r) for r in out_players]
+    potential_formatted = [fmt_line(r) for r in potential]
 
-    text_parts = ["Предикт стартового состава:\n"]
-    if starters:
-        text_parts.append("✅ Ожидаемые в старте:\n" + "\n".join(starters))
-    if out_or_doubt:
-        text_parts.append("\n🚑 OUT / DOUBT:\n" + "\n".join(out_or_doubt))
+    text_parts = ["Предикт стартового состава (топ 11 по вероятности):\n"]
+
+    if starters_formatted:
+        text_parts.append("✅ Старт:\n" + "\n".join(starters_formatted))
+        if len(starters_formatted) < 11:
+            text_parts.append(f"\n⚠️ Найдено только {len(starters_formatted)} игроков (недостаточно данных).")
+
+    if out_formatted:
+        text_parts.append("\n❌ Не сыграют:\n" + "\n".join(out_formatted))
+
+    if potential_formatted:
+        text_parts.append("\n🔁 Возможны / скамейка / под вопросом:\n" + "\n".join(potential_formatted))
 
     text = "\n".join(text_parts)
+    if len(text) > 3900:
+        text = text[:3900] + "\n… (обрезано)"
+
     buttons = [
         [InlineKeyboardButton("⬅ Другая команда", callback_data=f"matchdb_{match_id}")],
         [InlineKeyboardButton("🏁 Лиги", callback_data="back_leagues")]
     ]
-    await query.edit_message_text(text[:3900], reply_markup=InlineKeyboardMarkup(buttons))
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 # ----- /force_seed (опционально) -----
