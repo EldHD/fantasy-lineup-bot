@@ -28,30 +28,6 @@ def parse_formation(code: str):
     parts = [int(p) for p in code.split("-")]
     return {"code": code, "def": parts[0], "mid": sum(parts[1:-1]), "fwd": parts[-1]}
 
-def classify_role(row, formation_meta):
-    pos_main = (row["position_main"] or "").lower()
-    detail = (row["position_detail"] or "").upper()
-    defenders = {"CB","RCB","LCB","RB","LB","RWB","LWB","CB-L","CB-R"}
-    dm = {"DM","CDM","DMC"}
-    mid_core = {"CM","RCM","LCM","CM-L","CM-R"}
-    am = {"AM","CAM","LAM","RAM","10"}
-    winger = {"RW","LW","W"}
-    forward = {"CF","ST","FW","SS","9"}
-    if pos_main == "goalkeeper" or detail == "GK":
-        return "goalkeeper"
-    if detail in defenders:
-        return "defender"
-    if detail in dm or detail in mid_core or detail in am:
-        return "midfielder"
-    if detail in forward:
-        return "forward"
-    if detail in winger:
-        return "forward" if formation_meta["fwd"] >= 3 else "midfielder"
-    if pos_main in ("defender","midfielder","forward"):
-        return pos_main
-    return "midfielder"
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(name, callback_data=f"league_{code}")] for name, code in LEAGUES]
     markup = InlineKeyboardMarkup(keyboard)
@@ -122,7 +98,6 @@ async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
     league_code = query.data.split("_", 1)[1]
-    print(f"[CALLBACK] league_code={league_code}")
     try:
         matches = await fetch_matches_by_league(league_code)
         if not matches:
@@ -144,8 +119,6 @@ async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_
             reply_markup=InlineKeyboardMarkup(buttons)
         )
     except Exception as e:
-        print(f"[ERROR] handle_league_selection {league_code}: {e}")
-        import traceback; traceback.print_exc()
         await query.edit_message_text(
             f"Произошла ошибка при загрузке матчей для {league_code.upper()} :(",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ К лигам", callback_data="back_leagues")]])
@@ -163,9 +136,8 @@ async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAUL
         )
         return
     header = (
-        f"Match ID: {match['id']}\n"
-        f"{match['home']['name']} (team {match['home']['id']}) vs {match['away']['name']} (team {match['away']['id']})\n"
-        f"{match['round']}\n"
+        f"{match['home']['name']} vs {match['away']['name']}\n"
+        f"Matchweek {match['round']}\n"
         f"Kickoff: {match['utc_kickoff']:%Y-%m-%d %H:%M UTC}\n\nВыберите команду:"
     )
     buttons = [
@@ -194,113 +166,104 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
+    # Формирование вывода
     formation_code = "4-2-3-1"
-    fm = parse_formation(formation_code)
-    for r in rows:
-        r["_role"] = classify_role(r, fm)
+    # Раскладываем
+    starters = [r for r in rows if r["will_start"]]
+    starters.sort(key=lambda r: -r["probability"])
+    if len(starters) > 11:
+        starters = starters[:11]
 
+    bench = [r for r in rows if not r["will_start"] and r["status_availability"] != "OUT"]
     out_players = [r for r in rows if r["status_availability"] == "OUT"]
-    doubt_players = [r for r in rows if r["status_availability"] == "DOUBT"]
-    ok_players = [r for r in rows if r["status_availability"] in (None, "OK")]
 
-    def base_sort(rs):
-        return sorted(
-            rs,
-            key=lambda r: (
-                {"goalkeeper": 0, "defender": 1, "midfielder": 2, "forward": 3}.get(r["_role"], 99),
-                -r["probability"],
-                r["full_name"].lower()
-            )
-        )
+    def line_tag(r):
+        d = (r["position_detail"] or "").upper()
+        pm = r["position_main"]
+        if pm == "goalkeeper" or d == "GK":
+            return "GK"
+        DEF = {"CB","LCB","RCB","LB","RB","LWB","RWB"}
+        DM = {"DM","CDM"}
+        CM = {"CM"}
+        AM = {"AM","CAM","10"}
+        W = {"LW","RW"}
+        CF = {"CF","ST","SS"}
+        if d in DEF: return "DEF"
+        if d in DM: return "DM"
+        if d in CM: return "CM"
+        if d in AM: return "AM"
+        if d in W: return "WG"
+        if d in CF: return "CF"
+        if pm == "defender": return "DEF"
+        if pm == "forward": return "CF"
+        return "CM"
 
-    ok_sorted = base_sort(ok_players)
-    doubt_sorted = base_sort(doubt_players)
+    for r in starters:
+        r["_lt"] = line_tag(r)
 
-    starters = []
-    gk_ok = [r for r in ok_sorted if r["_role"] == "goalkeeper"]
-    gk_doubt = [r for r in doubt_sorted if r["_role"] == "goalkeeper"]
-    if gk_ok: starters.append(gk_ok[0])
-    elif gk_doubt: starters.append(gk_doubt[0])
-    else:
-        any_left = ok_sorted + doubt_sorted
-        if any_left: starters.append(any_left[0])
-    starter_ids = {r["player_id"] for r in starters}
+    order_line = ["GK","DEF","DM","CM","AM","WG","CF"]
+    starters_sorted = []
+    for tag in order_line:
+        starters_sorted.extend([r for r in starters if r["_lt"] == tag])
+    # остаток
+    starters_sorted.extend([r for r in starters if r not in starters_sorted])
 
-    def fill(role, need):
-        nonlocal starters, starter_ids
-        ok_pool = [r for r in ok_sorted if r["_role"] == role and r["player_id"] not in starter_ids]
-        db_pool = [r for r in doubt_sorted if r["_role"] == role and r["player_id"] not in starter_ids]
-        for pool in (ok_pool, db_pool):
-            for r in pool:
-                if len([s for s in starters if s["_role"] == role]) >= need:
-                    break
-                starters.append(r)
-                starter_ids.add(r["player_id"])
-
-    fill("defender", fm["def"])
-    fill("midfielder", fm["mid"])
-    fill("forward", fm["fwd"])
-
-    if len(starters) < 11:
-        remain = [r for r in ok_sorted + doubt_sorted if r["player_id"] not in starter_ids]
-        for r in remain:
-            if len(starters) >= 11:
-                break
-            starters.append(r)
-            starter_ids.add(r["player_id"])
-
-    potential = [r for r in ok_sorted + doubt_sorted if r["player_id"] not in starter_ids]
-
-    def fmt_line(r):
+    def fmt_player(r):
+        num = (str(r["number"]) if r["number"] else "-").rjust(2)
         pos = r["position_detail"] or r["position_main"]
-        tags = []
-        if r["status_availability"] == "DOUBT":
-            tags.append("❓ Doubt")
-            if r in starters:
-                tags.append("(* риск)")
-        if r["status_availability"] == "OUT":
-            tags.append("❌ OUT")
-        line = f"{r['number'] or '-'} {r['full_name']} — {pos} | {r['probability']}%"
-        if tags:
-            line += " | " + " ".join(tags)
-        expl = []
-        if r["explanation"]:
-            expl.append(r["explanation"])
-        if r["status_reason"]:
-            expl.append(r["status_reason"])
-        if expl:
-            line += "\n  " + "; ".join(expl)
-        return line
+        return f"{num} {r['full_name']} ({pos}) {r['probability']}%"
 
-    starters_txt = [fmt_line(r) for r in starters]
-    out_txt = [fmt_line(r) for r in out_players]
-    pot_txt = [fmt_line(r) for r in potential]
+    # Блоки старта по линиям
+    def block(tag, title):
+        items = [fmt_player(r) for r in starters_sorted if r["_lt"] == tag]
+        if items:
+            return f"{title}:\n" + "\n".join(items)
+        return ""
 
-    parts_out = [
-        f"Схема: {fm['code']}",
-        "Предикт стартового состава:",
-        "",
-        "✅ Старт:",
-        *starters_txt
+    start_blocks = [
+        block("GK", "🧤 GK"),
+        block("DEF", "🛡 DEF"),
+        block("DM", "🧱 DM"),
+        block("CM", "⚙️ CM"),
+        block("AM", "🎨 AM"),
+        block("WG", "⚡ Wings"),
+        block("CF", "🎯 CF"),
     ]
-    if len(starters_txt) < 11:
-        parts_out.append(f"\n⚠️ Только {len(starters_txt)} игроков (недостаточно данных).")
-    if out_txt:
-        parts_out += ["", "❌ Не сыграют:", *out_txt]
-    if pot_txt:
-        parts_out += ["", "🔁 Возможны / скамейка:", *pot_txt]
+    start_text = "\n\n".join([b for b in start_blocks if b])
 
-    text = "\n".join(parts_out)
-    if len(text) > 3900:
-        text = text[:3900] + "\n… (обрезано)"
+    def fmt_out(r):
+        pos = r["position_detail"] or r["position_main"]
+        reason = r["status_reason"] or r["explanation"] or "No reason"
+        return f"{r['full_name']} ({pos}) — ❌ {reason}"
+
+    def fmt_bench(r):
+        pos = r["position_detail"] or r["position_main"]
+        return f"{r['full_name']} ({pos}) {r['probability']}%"
+
+    out_text = "\n".join(fmt_out(r) for r in out_players) if out_players else "—"
+    bench_text = "\n".join(fmt_bench(r) for r in bench[:12]) if bench else "—"
+
+    lines = [
+        f"Схема: {formation_code}",
+        "✅ **Старт (11):**",
+        start_text if start_text else "(нет данных)",
+        "",
+        "❌ **Не сыграют:**",
+        out_text,
+        "",
+        "🔁 **Скамейка / опция:**",
+        bench_text
+    ]
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3800] + "\n… (обрезано)"
 
     buttons = [
         [InlineKeyboardButton("⬅ Другая команда", callback_data=f"matchdb_{match_id}")],
         [InlineKeyboardButton("🏁 Лиги", callback_data="back_leagues")]
     ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
 async def debug_catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
-        print("[CATCH-ALL] data =", update.callback_query.data)
         await update.callback_query.answer()
