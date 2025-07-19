@@ -1,27 +1,60 @@
-from typing import List, Optional
+from typing import List
 from sqlalchemy import select
 from bot.db.database import SessionLocal
-from bot.db.models import Team, Player
-from bot.external.sofascore import fetch_team_players, SOFASCORE_TEAM_IDS, SofascoreError
+from bot.db.models import Team, Player, PlayerStatus
+from bot.external.sofascore import (
+    fetch_team_players as sofa_fetch_players,
+    SOFASCORE_TEAM_IDS,
+    SofascoreError,
+)
+from bot.external.transfermarkt import (
+    fetch_team_squad,
+    fetch_injury_list,
+    TMError,
+    TRANSFERMARKT_TEAM_IDS,
+)
 
-POS_MAP_MAIN = {
-    "G": "goalkeeper",
-    "GK": "goalkeeper",
-    "D": "defender",
-    "DF": "defender",
-    "M": "midfielder",
-    "MF": "midfielder",
-    "F": "forward",
-    "FW": "forward",
-    "ATT": "forward",
-}
+import os
+
+DISABLE_SOFA = os.environ.get("DISABLE_SOFASCORE") == "1"
+
+def _normalize_name(name: str) -> str:
+    return name.strip().lower()
 
 
-def extract_detail(p: dict) -> Optional[str]:
+async def _sync_from_sofascore(team) -> str:
+    sofa_id = SOFASCORE_TEAM_IDS.get(team.name)
+    if not sofa_id:
+        return f"No Sofascore ID for {team.name}"
+    players_raw = await sofa_fetch_players(sofa_id)
+    return await _upsert_players(team, [
+        {
+            "full_name": p.get("name") or p.get("shortName") or p.get("slug") or "",
+            "shirt_number": p.get("shirtNumber") or p.get("jerseyNumber"),
+            "position_main": _map_main_sofa(p.get("position")),
+            "position_detail": _detail_sofa(p),
+        } for p in players_raw
+    ])
+
+
+def _map_main_sofa(pos_raw):
+    if not pos_raw:
+        return "midfielder"
+    pos_raw = pos_raw.upper()
+    if pos_raw in ("G", "GK"):
+        return "goalkeeper"
+    if pos_raw in ("D", "DF"):
+        return "defender"
+    if pos_raw in ("M", "MF"):
+        return "midfielder"
+    if pos_raw in ("F", "FW", "ATT"):
+        return "forward"
+    return "midfielder"
+
+
+def _detail_sofa(p: dict):
     info = p.get("positionInfo") or {}
     desc = (info.get("description") or "").title()
-    if not desc:
-        return None
     mapping = {
         "Centre-Back": "CB",
         "Left-Back": "LB",
@@ -35,82 +68,113 @@ def extract_detail(p: dict) -> Optional[str]:
         "Goalkeeper": "GK",
         "Second Striker": "SS",
     }
-    return mapping.get(desc, desc[:12])
+    return mapping.get(desc, desc[:12]) if desc else None
 
 
-def map_main(pos_raw: str) -> str:
-    return POS_MAP_MAIN.get((pos_raw or "").upper(), "midfielder")
+async def _sync_from_transfermarkt(team) -> str:
+    squad = await fetch_team_squad(team.name)
+    report_players = await _upsert_players(team, squad)
+
+    # Травмы / дисквалы
+    injuries = await fetch_injury_list(team.name)
+    if injuries:
+        async with SessionLocal() as session:
+            # Получим текущих игроков
+            stmt = select(Player).where(Player.team_id == team.id)
+            res = await session.execute(stmt)
+            players = res.scalars().all()
+            by_name = {_normalize_name(p.full_name): p for p in players}
+
+            created_status = 0
+            for it in injuries:
+                nm = _normalize_name(it["full_name"])
+                player = by_name.get(nm)
+                if not player:
+                    continue
+                # Добавим статус (упрощённо, без проверки дубликатов для MVP)
+                status = PlayerStatus(
+                    player_id=player.id,
+                    type="injury",
+                    availability="OUT",
+                    reason=it["reason"][:180] if it["reason"] else None,
+                    raw_status=it["reason"],
+                )
+                session.add(status)
+                created_status += 1
+            await session.commit()
+        report_players += f"; statuses={created_status}"
+    return report_players
+
+
+async def _upsert_players(team, player_dicts):
+    async with SessionLocal() as session:
+        stmt = select(Player).where(Player.team_id == team.id)
+        res = await session.execute(stmt)
+        existing = res.scalars().all()
+        existing_by_name = {_normalize_name(p.full_name): p for p in existing}
+
+        created = 0
+        updated = 0
+        for pd in player_dicts:
+            full_name = pd.get("full_name", "").strip()
+            if not full_name:
+                continue
+            key = _normalize_name(full_name)
+            pos_main = pd.get("position_main") or "midfielder"
+            pos_detail = pd.get("position_detail")
+            number = pd.get("shirt_number")
+
+            if key in existing_by_name:
+                p = existing_by_name[key]
+                changed = False
+                if p.position_main != pos_main:
+                    p.position_main = pos_main; changed = True
+                if pos_detail and p.position_detail != pos_detail:
+                    p.position_detail = pos_detail; changed = True
+                if number and p.shirt_number != number:
+                    p.shirt_number = number; changed = True
+                if changed:
+                    updated += 1
+            else:
+                session.add(Player(
+                    team_id=team.id,
+                    full_name=full_name,
+                    position_main=pos_main,
+                    position_detail=pos_detail,
+                    shirt_number=number
+                ))
+                created += 1
+        await session.commit()
+    return f"created={created}, updated={updated}, total_now={created+len(existing)}"
 
 
 async def sync_team_roster(team_name: str):
-    """
-    Синхронизирует игроков одной команды.
-    Возвращает строку-результат (для отображения пользователю).
-    """
     async with SessionLocal() as session:
         stmt = select(Team).where(Team.name == team_name)
         res = await session.execute(stmt)
         team = res.scalar_one_or_none()
         if not team:
-            return f"Team '{team_name}' not found in DB."
+            return f"Team '{team_name}' not found."
 
-        sofa_id = SOFASCORE_TEAM_IDS.get(team.name)
-        if not sofa_id:
-            return f"No Sofascore ID mapped for '{team.name}'"
-
+    # Порядок: Sofa → (при 403/любая ошибка) → Transfermarkt
+    if not DISABLE_SOFA and team_name in SOFASCORE_TEAM_IDS:
         try:
-            players_raw = await fetch_team_players(sofa_id)
+            return f"{team_name} (Sofa): " + await _sync_from_sofascore(team)
         except SofascoreError as e:
-            return f"Sofascore error for {team.name}: {e}"
+            # fallback на TM
+            pass
         except Exception as e:
-            return f"Unexpected error for {team.name}: {e}"
+            pass  # всё равно fallback
 
-        created = 0
-        updated = 0
-
-        ex_stmt = select(Player).where(Player.team_id == team.id)
-        ex_res = await session.execute(ex_stmt)
-        existing = ex_res.scalars().all()
-        by_name = {p.full_name.lower(): p for p in existing}
-
-        for pr in players_raw:
-            full_name = pr.get("name") or pr.get("shortName") or pr.get("slug") or ""
-            if not full_name:
-                continue
-            key = full_name.lower()
-            pos_raw = pr.get("position") or pr.get("player", {}).get("position")
-            position_main = map_main(pos_raw)
-            position_detail = extract_detail(pr)
-            number = pr.get("shirtNumber") or pr.get("jerseyNumber") or None
-            sf_id = pr.get("id")
-
-            if key in by_name:
-                p = by_name[key]
-                changed = False
-                if p.position_main != position_main:
-                    p.position_main = position_main; changed = True
-                if position_detail and p.position_detail != position_detail:
-                    p.position_detail = position_detail; changed = True
-                if number and p.shirt_number != number:
-                    p.shirt_number = number; changed = True
-                if sf_id and p.sf_id != sf_id:
-                    p.sf_id = sf_id; changed = True
-                if changed:
-                    updated += 1
-            else:
-                new_p = Player(
-                    team_id=team.id,
-                    full_name=full_name,
-                    shirt_number=number,
-                    position_main=position_main,
-                    position_detail=position_detail,
-                    sf_id=sf_id,
-                )
-                session.add(new_p)
-                created += 1
-
-        await session.commit()
-        return f"Roster sync for {team.name}: created={created}, updated={updated}, total_now={created+len(existing)}"
+    # Transfermarkt fallback
+    if team_name in TRANSFERMARKT_TEAM_IDS:
+        try:
+            return f"{team_name} (TM): " + await _sync_from_transfermarkt(team)
+        except TMError as e:
+            return f"{team_name} TM error: {e}"
+        except Exception as e:
+            return f"{team_name} unexpected TM error: {e}"
+    return f"{team_name}: no data source (no IDs)."
 
 
 async def sync_multiple_teams(team_names: List[str]):
