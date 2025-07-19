@@ -3,7 +3,7 @@ import asyncio
 import random
 import re
 from selectolax.parser import HTMLParser
-from typing import List, Dict, Optional
+from typing import Optional, List, Dict
 
 TRANSFERMARKT_TEAM_IDS = {
     "Arsenal": 11,
@@ -19,6 +19,7 @@ UA_LIST = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
 ]
+
 
 class TMError(Exception):
     pass
@@ -58,8 +59,11 @@ def _clean(s: Optional[str]) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
-def _parse_shirt_number(raw: str) -> Optional[int]:
-    m = re.search(r"\d+", raw or "")
+def _parse_shirt_number_cell(raw: str):
+    raw = _clean(raw)
+    if not raw or raw in {"-", "—"}:
+        return None
+    m = re.search(r"\d+", raw)
     return int(m.group()) if m else None
 
 
@@ -101,7 +105,7 @@ def _map_detail(raw: str):
     return None
 
 
-def _extract_position_from_row(row) -> str:
+def _extract_position_from_row(row):
     inline_tbl = row.css_first("table.inline-table")
     if inline_tbl:
         text_chunks = []
@@ -136,7 +140,7 @@ async def fetch_team_squad(team_name: str):
         tds = row.css("td")
         if len(tds) < 2:
             continue
-        number = _parse_shirt_number(tds[0].text())
+        number = _parse_shirt_number_cell(tds[0].text())
         link = row.css_first("td a")
         full_name = _clean(link.text()) if link else _clean(row.text())
         if not full_name or len(full_name) < 2:
@@ -153,6 +157,28 @@ async def fetch_team_squad(team_name: str):
     if not players:
         raise TMError("No players parsed")
     return players
+
+
+def _normalize_reason(player_name: str, raw_reason: str) -> str:
+    reason = _clean(raw_reason)
+    # Убираем повтор имени
+    if reason.lower() == player_name.lower():
+        reason = ""
+    # Если пусто или коротко
+    if not reason or len(reason) < 3:
+        reason = "Injury (unspecified)"
+    # Признаки дисквалификации
+    low = reason.lower()
+    if any(k in low for k in ["suspens", "yellow", "red", "disciplin", "ban"]):
+        # Нормализуем
+        if "yellow" in low:
+            reason = "Suspension (yellow cards)"
+        elif "red" in low:
+            reason = "Suspension (red card)"
+        else:
+            reason = "Suspension"
+    # Капитализация – уже нормальная, просто возвращаем
+    return reason
 
 
 async def fetch_injury_list(team_name: str):
@@ -175,13 +201,13 @@ async def fetch_injury_list(team_name: str):
             continue
         name_link = row.css_first("td a")
         full_name = _clean(name_link.text()) if name_link else _clean(row.text())
-        reason_cell = tds[1].text() if len(tds) > 1 else ""  # <-- фикс индекса
-        reason = _clean(reason_cell)
+        raw_reason = tds[1].text() if len(tds) > 1 else ""
+        reason = _normalize_reason(full_name, raw_reason)
         if full_name:
             out_list.append({
                 "full_name": full_name,
                 "availability": "OUT",
-                "reason": reason or "Unavailable",
+                "reason": reason,
             })
     return out_list
 
