@@ -1,9 +1,9 @@
 from sqlalchemy import select, delete
 from bot.db.database import SessionLocal
-from bot.db.models import Player, Prediction, Match, PlayerStatus
-from typing import List, Dict
+from bot.db.models import Player, Prediction, Match, PlayerStatus, Tournament
+from typing import List
+from datetime import datetime, timedelta
 
-# Расширяем отображение деталей в унифицированные линии
 ROLE_MAP_DETAIL = {
     "GK": "GK",
     "CB": "DEF", "LCB": "DEF", "RCB": "DEF",
@@ -23,7 +23,6 @@ def classify_line(player):
         return "GK"
     if d in ROLE_MAP_DETAIL:
         return ROLE_MAP_DETAIL[d]
-    # эвристики по тексту
     if "BACK" in d:
         return "DEF"
     if "WING" in d:
@@ -31,13 +30,11 @@ def classify_line(player):
     if "STRIK" in d or "FORWARD" in d or "ATT" in d:
         return "CF"
     if "MID" in d:
-        # если есть DEF в тексте — опорник
         if "DEF" in d:
             return "DM"
         if "ATT" in d:
             return "AM"
         return "CM"
-    # fallback по основной позиции
     if pm == "defender":
         return "DEF"
     if pm == "forward":
@@ -55,16 +52,6 @@ def sort_players(block):
 
 
 def distribute_starters(healthy_players):
-    """
-    Гибкая сборка 4-2-3-1:
-    - 1 GK
-    - 4 DEF
-    - 2 (DM/CM)
-    - 3 (AM/WG/CM)
-    - 1 CF (fallback если нет)
-    Всегда возвращает ровно 11 (если игроков >= 11).
-    """
-    # Группы
     gk = sort_players([p for p in healthy_players if p._line == "GK"])
     df = sort_players([p for p in healthy_players if p._line == "DEF"])
     dm = sort_players([p for p in healthy_players if p._line == "DM"])
@@ -74,68 +61,42 @@ def distribute_starters(healthy_players):
     cf = sort_players([p for p in healthy_players if p._line == "CF"])
 
     starters = []
-
-    # 1 GK
     if gk:
         starters.append(gk[0])
-
-    # 4 DEF (или сколько есть)
     starters.extend(df[:4])
-
-    # 2 deeper mids (DM приоритет, потом CM)
     deeper_pool = dm + cm
     starters.extend(deeper_pool[:2])
-
-    # 3 атакующие (AM + WG + оставшиеся CM)
     att_pool = am + wg + cm[2:]
     for p in att_pool:
-        if len([s for s in starters if s not in gk]) >= 1 + 4 + 2 + 3:  # уже взяли нужное
+        if len(starters) >= 1 + 4 + 2 + 3:  # 10 пока
             break
         if p not in starters:
             starters.append(p)
-
-    # CF
     if cf:
-        # берём лучшего
-        best_cf = cf[0]
-        if best_cf not in starters:
-            starters.append(best_cf)
+        if cf[0] not in starters:
+            starters.append(cf[0])
     else:
-        # Fallback: попытка взять ещё одного атакующего из AM/WG/CM/DM
         fallback_pool = am + wg + cm + dm
         for cand in fallback_pool:
             if cand not in starters:
                 starters.append(cand)
                 break
-
-    # Теперь доводим до 11, если вдруг ещё меньше
     if len(starters) < 11:
         remaining = [p for p in healthy_players if p not in starters]
         starters.extend(remaining[:(11 - len(starters))])
-
-    # Ровно 11 (если игроков достаточно)
     return starters[:11]
 
 
 def assign_probabilities(starters, bench, statuses_map):
-    """
-    Возвращает {player_id: (will_start, probability, explanation)}
-    OUT = 3%, will_start=False.
-    Bench = 60%.
-    Стартеры 95→80 плавной линейкой.
-    """
     result = {}
-
     line_priority = {"GK": 0, "DEF": 1, "DM": 2, "CM": 3, "AM": 4, "WG": 5, "CF": 6}
     starters_sorted = sorted(starters, key=lambda p: (line_priority.get(p._line, 9), p.full_name.lower()))
     total = len(starters_sorted)
-
     for idx, p in enumerate(starters_sorted):
         st = statuses_map.get(p.id)
         if st and st.availability == "OUT":
             result[p.id] = (False, 3, "OUT (injury)")
             continue
-        # линейная интерполяция стартовых
         if total > 1:
             frac = idx / (total - 1)
             prob = round(95 - (95 - 80) * frac)
@@ -149,7 +110,6 @@ def assign_probabilities(starters, bench, statuses_map):
             result[p.id] = (False, 3, "OUT (injury)")
         else:
             result[p.id] = (False, 60, "Bench / rotation")
-
     return result
 
 
@@ -171,11 +131,9 @@ async def generate_baseline_predictions(match_id: int, team_id: int):
         statuses = st_res.scalars().all()
         latest_status = {}
         for s in statuses:
-            # Просто первый встретившийся OUT фиксируем (для MVP)
             if s.player_id not in latest_status:
                 latest_status[s.player_id] = s
 
-        # Классификация + разделение health / out
         healthy = []
         out_list = []
         for p in players:
@@ -194,7 +152,6 @@ async def generate_baseline_predictions(match_id: int, team_id: int):
         await session.flush()
 
         probs = assign_probabilities(starters, bench, latest_status)
-
         for p in players:
             will_start, probability, explanation = probs[p.id]
             session.add(Prediction(
@@ -204,6 +161,34 @@ async def generate_baseline_predictions(match_id: int, team_id: int):
                 probability=probability,
                 explanation=explanation
             ))
-
         await session.commit()
         return f"Predictions generated (4-2-3-1 improved) starters={len(starters)}, total_players={len(players)}"
+
+
+async def generate_predictions_for_upcoming_matches(days_ahead: int, tournament_code: str):
+    """
+    Ищем матчи по турниру в интервале [now, now + days_ahead]
+    Генерируем предикты для обеих команд, если есть ростеры.
+    """
+    now = datetime.utcnow()
+    end = now + timedelta(days=days_ahead)
+    async with SessionLocal() as session:
+        t_res = await session.execute(select(Tournament).where(Tournament.code == tournament_code))
+        tournament = t_res.scalar_one_or_none()
+        if not tournament:
+            return 0
+        m_res = await session.execute(
+            select(Match).where(
+                Match.tournament_id == tournament.id,
+                Match.utc_kickoff >= now,
+                Match.utc_kickoff <= end
+            )
+        )
+        matches = m_res.scalars().all()
+    count = 0
+    for m in matches:
+        # Две стороны
+        await generate_baseline_predictions(m.id, m.home_team_id)
+        await generate_baseline_predictions(m.id, m.away_team_id)
+        count += 1
+    return count
