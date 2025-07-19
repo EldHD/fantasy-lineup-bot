@@ -19,18 +19,20 @@ from bot.handlers import (
     back_to_leagues,
     debug_db,
 )
-from bot.services.scheduler import start_scheduler
-from bot.config import ENABLE_SCHEDULER
+from bot.services.job_tasks import schedule_jobs
+from bot.config import (
+    SYNC_INTERVAL_SEC,
+    PREDICT_INTERVAL_SEC,
+    FIRST_SYNC_DELAY,
+    FIRST_PREDICT_DELAY,
+    DISABLE_JOBS,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 def _get_bot_token():
-    """
-    Ищем токен в нескольких ключах, чтобы не путаться.
-    Приоритет: BOT_TOKEN > TELEGRAM_BOT_TOKEN > TELEGRAM_TOKEN
-    """
     for key in ("BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN"):
         val = os.environ.get(key)
         if val:
@@ -63,16 +65,19 @@ def build_app(bot_token: str):
 def main():
     token = _get_bot_token()
     if not token:
-        env_keys_preview = ", ".join(sorted(list(os.environ.keys())[:25]))
-        logger.error("BOT_TOKEN not set. First 25 env keys: %s", env_keys_preview)
         raise RuntimeError("BOT_TOKEN / TELEGRAM_TOKEN not set")
 
     app = build_app(token)
-    scheduler = start_scheduler()
-    if ENABLE_SCHEDULER:
-        logger.info("Scheduler enabled.")
-    else:
-        logger.info("Scheduler disabled (set ENABLE_SCHEDULER=1 to enable).")
+
+    # Подключаем задачи JobQueue (вместо старого APScheduler)
+    schedule_jobs(
+        app.job_queue,
+        sync_interval_sec=SYNC_INTERVAL_SEC,
+        predict_interval_sec=PREDICT_INTERVAL_SEC,
+        first_sync_delay=FIRST_SYNC_DELAY,
+        first_predict_delay=FIRST_PREDICT_DELAY,
+        disabled=DISABLE_JOBS
+    )
 
     logger.info("Bot starting polling...")
     app.run_polling()
