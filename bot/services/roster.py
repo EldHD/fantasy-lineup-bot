@@ -1,6 +1,5 @@
-from typing import List, Dict, Optional
+from typing import List, Optional
 from sqlalchemy import select
-from sqlalchemy.exc import NoResultFound
 from bot.db.database import SessionLocal
 from bot.db.models import Team, Player
 from bot.external.sofascore import fetch_team_players, SOFASCORE_TEAM_IDS
@@ -17,14 +16,12 @@ POS_MAP_MAIN = {
     "ATT": "forward",
 }
 
-# Детальная позиция: берем из positionInfo (пример: { "position": "D", "description": "Centre-Back" })
+
 def extract_detail(p: dict) -> Optional[str]:
     info = p.get("positionInfo") or {}
-    desc = info.get("description") or ""
-    desc = desc.title()
+    desc = (info.get("description") or "").title()
     if not desc:
         return None
-    # Упростим пару частых вариантов
     mapping = {
         "Centre-Back": "CB",
         "Left-Back": "LB",
@@ -40,11 +37,12 @@ def extract_detail(p: dict) -> Optional[str]:
     }
     return mapping.get(desc, desc[:12])
 
+
 def map_main(pos_raw: str) -> str:
     return POS_MAP_MAIN.get((pos_raw or "").upper(), "midfielder")
 
+
 async def sync_team_roster(team_name: str):
-    # ищем команду по name
     async with SessionLocal() as session:
         stmt = select(Team).where(Team.name == team_name)
         res = await session.execute(stmt)
@@ -60,11 +58,10 @@ async def sync_team_roster(team_name: str):
         created = 0
         updated = 0
 
-        # Для простоты текущие игроки по имени
-        existing_stmt = select(Player).where(Player.team_id == team.id)
-        ex_res = await session.execute(existing_stmt)
-        existing_players = ex_res.scalars().all()
-        by_name = {p.full_name.lower(): p for p in existing_players}
+        ex_stmt = select(Player).where(Player.team_id == team.id)
+        ex_res = await session.execute(ex_stmt)
+        existing = ex_res.scalars().all()
+        by_name = {p.full_name.lower(): p for p in existing}
 
         for pr in players_raw:
             full_name = pr.get("name") or pr.get("shortName") or pr.get("slug") or ""
@@ -91,7 +88,7 @@ async def sync_team_roster(team_name: str):
                 if changed:
                     updated += 1
             else:
-                p = Player(
+                new_p = Player(
                     team_id=team.id,
                     full_name=full_name,
                     shirt_number=number,
@@ -99,11 +96,12 @@ async def sync_team_roster(team_name: str):
                     position_detail=position_detail,
                     sf_id=sf_id,
                 )
-                session.add(p)
+                session.add(new_p)
                 created += 1
 
         await session.commit()
-        return f"Roster sync for {team.name}: created={created}, updated={updated}, total_now={created+len(existing_players)}"
+        return f"Roster sync for {team.name}: created={created}, updated={updated}, total_now={created+len(existing)}"
+
 
 async def sync_multiple_teams(team_names: List[str]):
     reports = []
