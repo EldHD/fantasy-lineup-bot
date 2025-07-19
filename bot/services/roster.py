@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from sqlalchemy import select
 from bot.db.database import SessionLocal
 from bot.db.models import Team, Player, PlayerStatus, Tournament
@@ -20,14 +20,38 @@ logger = logging.getLogger(__name__)
 
 DISABLE_SOFA = os.environ.get("DISABLE_SOFASCORE") == "1"
 
+# ---- Фиксированные короткие коды (≤12 символов) ----
+FIXED_TEAM_CODES = {
+    "Arsenal": "ARS",
+    "Aston Villa": "AVL",
+    "Bournemouth": "BOU",
+    "Brentford": "BRE",
+    "Brighton & Hove Albion": "BHA",
+    "Chelsea": "CHE",
+    "Crystal Palace": "CRY",
+    "Everton": "EVE",
+    "Fulham": "FUL",
+    "Ipswich Town": "IPS",
+    "Leicester City": "LEI",
+    "Liverpool": "LIV",
+    "Manchester City": "MCI",
+    "Manchester United": "MUN",
+    "Newcastle United": "NEW",
+    "Nottingham Forest": "NFO",
+    "Southampton": "SOU",
+    "Tottenham Hotspur": "TOT",
+    "West Ham United": "WHU",
+    "Wolverhampton Wanderers": "WOL",
+    "Zenit": "ZEN",
+    "CSKA Moscow": "CSKA",
+}
 
-# ---------------- Utility ---------------- #
+# -------------------------------- Utility -------------------------------- #
 
 def _normalize_name(name: str) -> str:
     return name.strip().lower()
 
-
-def _map_main_sofa(pos_raw):
+def _map_main_sofa(pos_raw: Optional[str]):
     if not pos_raw:
         return "midfielder"
     pos_raw = pos_raw.upper()
@@ -40,7 +64,6 @@ def _map_main_sofa(pos_raw):
     if pos_raw in ("F", "FW", "ATT"):
         return "forward"
     return "midfielder"
-
 
 def _detail_sofa(p: dict):
     info = p.get("positionInfo") or {}
@@ -60,37 +83,25 @@ def _detail_sofa(p: dict):
     }
     return mapping.get(desc, desc[:12]) if desc else None
 
-
-def generate_team_code(name: str, occupied: set) -> str:
+def _fallback_code_from_name(name: str) -> str:
     """
-    Делает slug: только a-z0-9 и '_', режет до 32 символов.
-    Обеспечивает уникальность (добавляет -2, -3 ...).
+    Если вдруг команда вне словаря – создаём безопасный <=12 slug.
     """
-    base = name.lower()
-    base = re.sub(r'[^a-z0-9]+', '_', base)
-    base = re.sub(r'_+', '_', base).strip('_')
-    if not base:
-        base = "team"
-    base = base[:32]
-
-    code = base
-    counter = 2
-    while code in occupied:
-        suffix = f"_{counter}"
-        max_len = 32 - len(suffix)
-        code = base[:max_len] + suffix
-        counter += 1
-    occupied.add(code)
-    return code
-
+    slug = re.sub(r'[^A-Za-z0-9]+', '_', name.lower())
+    slug = re.sub(r'_+', '_', slug).strip('_')
+    if not slug:
+        slug = "team"
+    if len(slug) > 12:
+        slug = slug[:12]
+    return slug.upper()
 
 # ---------------- Ensure Teams ---------------- #
 
 async def ensure_teams_exist(team_names: List[str], tournament_code: str):
     """
-    Создаёт недостающие команды, привязывает к турниру и гарантирует code != NULL.
-    Также чинит (repair) команды без кода.
-    Возвращает: количество *новых* команд.
+    Создаёт недостающие команды, гарантирует короткий уникальный code (≤12),
+    чинит отсутствующий tournament_id или code.
+    Возвращает количество новых команд.
     """
     async with SessionLocal() as session:
         # Турнир
@@ -102,15 +113,29 @@ async def ensure_teams_exist(team_names: List[str], tournament_code: str):
             await session.flush()
             logger.info("Created tournament %s (id=%s)", tournament_code, tournament.id)
 
-        # Все команды этого турнира + те, что по именам (чтобы найти «старые» без турнира)
+        # Все команды по именам
         existing_res = await session.execute(select(Team).where(Team.name.in_(team_names)))
-        existing_all = existing_res.scalars().all()
-        existing_by_name = {t.name: t for t in existing_all}
+        existing = existing_res.scalars().all()
+        existing_by_name = {t.name: t for t in existing}
 
-        # Собираем занятые коды (не только для этих команд), чтобы избежать коллизий
+        # Уже занятые коды (всей БД)
         all_team_res = await session.execute(select(Team))
         all_teams = all_team_res.scalars().all()
-        occupied_codes = {t.code for t in all_teams if getattr(t, "code", None)}
+        occupied = {t.code for t in all_teams if getattr(t, "code", None)}
+
+        def unique_code(code: str) -> str:
+            base = code
+            if base not in occupied:
+                occupied.add(base)
+                return base
+            # Добавляем числовые суффиксы при коллизии
+            idx = 2
+            while True:
+                candidate = (base[: (12 - len(str(idx)) - 1)] + f"_{idx}").upper()
+                if candidate not in occupied:
+                    occupied.add(candidate)
+                    return candidate
+                idx += 1
 
         created = 0
         repaired_code = 0
@@ -119,16 +144,29 @@ async def ensure_teams_exist(team_names: List[str], tournament_code: str):
         for name in team_names:
             team = existing_by_name.get(name)
             if team:
-                # repair tournament_id
+                # Дополняем tournament_id
                 if getattr(team, "tournament_id", None) in (None, 0):
                     team.tournament_id = tournament.id
                     repaired_tournament += 1
-                # repair code
+                # Дополняем / чиним code
                 if not getattr(team, "code", None):
-                    team.code = generate_team_code(team.name, occupied_codes)
+                    raw = FIXED_TEAM_CODES.get(name) or _fallback_code_from_name(name)
+                    if len(raw) > 12:
+                        raw = raw[:12]
+                    code = unique_code(raw)
+                    team.code = code
                     repaired_code += 1
+                else:
+                    # Если почему-то длинный >12 (на всякий случай)
+                    if len(team.code) > 12:
+                        new_code = unique_code(team.code[:12])
+                        team.code = new_code
+                        repaired_code += 1
             else:
-                code = generate_team_code(name, occupied_codes)
+                raw = FIXED_TEAM_CODES.get(name) or _fallback_code_from_name(name)
+                if len(raw) > 12:
+                    raw = raw[:12]
+                code = unique_code(raw)
                 new_team = Team(
                     name=name,
                     code=code,
@@ -146,13 +184,9 @@ async def ensure_teams_exist(team_names: List[str], tournament_code: str):
 
         return created
 
-
 # ---------------- Upsert Players ---------------- #
 
 async def _upsert_players(team, player_dicts):
-    """
-    Обновляем/создаём игроков. Возвращает текст отчёта.
-    """
     async with SessionLocal() as session:
         stmt = select(Player).where(Player.team_id == team.id)
         res = await session.execute(stmt)
@@ -161,7 +195,6 @@ async def _upsert_players(team, player_dicts):
 
         created = 0
         updated = 0
-
         for pd in player_dicts:
             full_name = (pd.get("full_name") or "").strip()
             if not full_name:
@@ -175,14 +208,11 @@ async def _upsert_players(team, player_dicts):
                 p = existing_by_name[key]
                 changed = False
                 if p.position_main != pos_main:
-                    p.position_main = pos_main
-                    changed = True
+                    p.position_main = pos_main; changed = True
                 if pos_detail and p.position_detail != pos_detail:
-                    p.position_detail = pos_detail
-                    changed = True
+                    p.position_detail = pos_detail; changed = True
                 if number and p.shirt_number != number:
-                    p.shirt_number = number
-                    changed = True
+                    p.shirt_number = number; changed = True
                 if changed:
                     updated += 1
             else:
@@ -194,14 +224,11 @@ async def _upsert_players(team, player_dicts):
                     shirt_number=number
                 ))
                 created += 1
-
         await session.commit()
-
     total_now = created + len(existing)
     return f"created={created}, updated={updated}, total_now={total_now}"
 
-
-# ---------------- Source: Sofascore ---------------- #
+# ---------------- Sofascore Source ---------------- #
 
 async def _sync_from_sofascore(team) -> str:
     sofa_id = SOFASCORE_TEAM_IDS.get(team.name)
@@ -217,8 +244,7 @@ async def _sync_from_sofascore(team) -> str:
         } for p in players_raw
     ])
 
-
-# ---------------- Source: Transfermarkt ---------------- #
+# ---------------- Transfermarkt Source ---------------- #
 
 async def _sync_from_transfermarkt(team) -> str:
     squad = await fetch_team_squad(team.name)
@@ -252,13 +278,9 @@ async def _sync_from_transfermarkt(team) -> str:
 
     return report_players
 
-
 # ---------------- Public Sync API ---------------- #
 
 async def sync_team_roster(team_name: str):
-    """
-    Синхронизация одной команды: Sofascore (если не отключено) -> Transfermarkt.
-    """
     async with SessionLocal() as session:
         stmt = select(Team).where(Team.name == team_name)
         res = await session.execute(stmt)
@@ -283,7 +305,6 @@ async def sync_team_roster(team_name: str):
             return f"{team_name} unexpected TM error: {e}"
 
     return f"{team_name}: no data source."
-
 
 async def sync_multiple_teams(team_names: List[str]):
     reports = []
