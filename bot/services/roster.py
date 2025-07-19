@@ -1,7 +1,7 @@
 from typing import List
 from sqlalchemy import select
 from bot.db.database import SessionLocal
-from bot.db.models import Team, Player, PlayerStatus
+from bot.db.models import Team, Player, PlayerStatus, Tournament
 from bot.external.sofascore import (
     fetch_team_players as sofa_fetch_players,
     SOFASCORE_TEAM_IDS,
@@ -56,6 +56,31 @@ def _detail_sofa(p: dict):
     return mapping.get(desc, desc[:12]) if desc else None
 
 
+async def ensure_teams_exist(team_names: List[str], tournament_code: str):
+    """
+    Создаёт записи Team для отсутствующих команд.
+    Требует, чтобы Tournament с кодом существовал.
+    """
+    async with SessionLocal() as session:
+        t_res = await session.execute(select(Tournament).where(Tournament.code == tournament_code))
+        tournament = t_res.scalar_one_or_none()
+        if not tournament:
+            # Создадим турнир быстро (MVP)
+            tournament = Tournament(code=tournament_code, name=tournament_code.upper())
+            session.add(tournament)
+            await session.flush()
+        existing_res = await session.execute(select(Team).where(Team.name.in_(team_names)))
+        existing = {t.name for t in existing_res.scalars().all()}
+        created = 0
+        for name in team_names:
+            if name not in existing:
+                session.add(Team(name=name))
+                created += 1
+        if created:
+            await session.commit()
+        return created
+
+
 async def _upsert_players(team, player_dicts):
     async with SessionLocal() as session:
         stmt = select(Player).where(Player.team_id == team.id)
@@ -79,7 +104,6 @@ async def _upsert_players(team, player_dicts):
                 changed = False
                 if p.position_main != pos_main:
                     p.position_main = pos_main; changed = True
-                # Обновляем detail даже если None раньше
                 if pos_detail and p.position_detail != pos_detail:
                     p.position_detail = pos_detail; changed = True
                 if number and p.shirt_number != number:
@@ -131,9 +155,10 @@ async def _sync_from_transfermarkt(team) -> str:
                 player = by_name.get(nm)
                 if not player:
                     continue
+                # Простая вставка без проверки дубликатов (MVP)
                 status = PlayerStatus(
                     player_id=player.id,
-                    type="injury",
+                    type="injury" if "suspens" not in (it["reason"].lower()) and "Suspension" not in it["reason"] else "suspension",
                     availability="OUT",
                     reason=it["reason"][:180] if it["reason"] else None,
                     raw_status=it["reason"],
