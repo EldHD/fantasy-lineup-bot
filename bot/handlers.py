@@ -11,6 +11,7 @@ from sqlalchemy import select
 from bot.db.database import SessionLocal
 from bot.db.models import Tournament, Match, Player
 
+
 LEAGUES = [
     ("Premier League", "epl"),
     ("La Liga", "laliga"),
@@ -20,6 +21,8 @@ LEAGUES = [
     ("Russian Premier League", "rpl"),
 ]
 
+
+# ---------------- Commands ---------------- #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(name, callback_data=f"league_{code}")] for name, code in LEAGUES]
@@ -81,6 +84,8 @@ async def debug_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = text[:3800] + "\n…truncated"
     await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
 
+
+# ---------------- Navigation Callbacks ---------------- #
 
 async def back_to_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -144,6 +149,51 @@ async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAUL
     await query.edit_message_text(header, reply_markup=InlineKeyboardMarkup(buttons))
 
 
+# ---------------- Team View (Reformatted to 4 Lines) ---------------- #
+
+def _line_group_tag(r):
+    """
+    Приводим все детали к 4 укрупнённым линиям:
+    GK, DEF, MID, FWD
+    """
+    d = (r["position_detail"] or "").upper()
+    pm = r["position_main"]
+    if pm == "goalkeeper" or d == "GK":
+        return "GK"
+    DEF = {"CB", "LCB", "RCB", "LB", "RB", "LWB", "RWB"}
+    MID_DEEP = {"DM", "CDM"}
+    MID = {"CM", "AM", "CAM", "10"}
+    WING = {"LW", "RW"}
+    FWD = {"CF", "ST", "SS"}
+    if d in DEF:
+        return "DEF"
+    if d in FWD:
+        return "FWD"
+    if d in WING:
+        return "MID"  # крылья считаем частью средней линии для 4-2-3-1
+    if d in MID or d in MID_DEEP:
+        return "MID"
+    # fallback
+    if pm == "defender":
+        return "DEF"
+    if pm == "forward":
+        return "FWD"
+    return "MID"
+
+
+def _fmt_player_line(r):
+    num = str(r["number"]) if r["number"] else "—"
+    pos = r["position_detail"] or r["position_main"]
+    return f"{num} {r['full_name']} ({pos}) {r['probability']}%"
+
+
+def _fmt_player_out(r):
+    num = str(r["number"]) if r["number"] else "—"
+    pos = r["position_detail"] or r["position_main"]
+    reason = r["status_reason"] or "Unavailable"
+    return f"{num} {r['full_name']} ({pos}) — ❌ {reason}"
+
+
 async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -163,75 +213,43 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     formation_code = "4-2-3-1"
-    starters = [r for r in rows if r["will_start"] and r["status_availability"] != "OUT"]
-    starters.sort(key=lambda r: -r["probability"])
-    # ровно 11 (если вдруг больше)
-    starters = starters[:11]
+
+    # Разделяем категории
+    raw_starters = [r for r in rows if r["will_start"] and r["status_availability"] != "OUT"]
+    # На всякий случай режем до 11
+    raw_starters.sort(key=lambda r: -r["probability"])
+    starters = raw_starters[:11]
+
     out_players = [r for r in rows if r["status_availability"] == "OUT"]
     bench = [r for r in rows if not r["will_start"] and r["status_availability"] != "OUT"]
 
-    def line_tag(r):
-        d = (r["position_detail"] or "").upper()
-        pm = r["position_main"]
-        if pm == "goalkeeper" or d == "GK": return "GK"
-        DEF = {"CB","LCB","RCB","LB","RB","LWB","RWB"}
-        DM = {"DM","CDM"}
-        CM = {"CM"}
-        AM = {"AM","CAM","10"}
-        W = {"LW","RW"}
-        CF = {"CF","ST","SS"}
-        if d in DEF: return "DEF"
-        if d in DM: return "DM"
-        if d in CM: return "CM"
-        if d in AM: return "AM"
-        if d in W: return "WG"
-        if d in CF: return "CF"
-        if pm == "defender": return "DEF"
-        if pm == "forward": return "CF"
-        return "CM"
-
+    # Помечаем линии 4-группово
     for r in starters:
-        r["_lt"] = line_tag(r)
+        r["_grp"] = _line_group_tag(r)
+    for r in out_players:
+        r["_grp"] = _line_group_tag(r)
+    for r in bench:
+        r["_grp"] = _line_group_tag(r)
 
-    order_line = ["GK","DEF","DM","CM","AM","WG","CF"]
-    starters_sorted = []
-    for tag in order_line:
-        starters_sorted.extend([r for r in starters if r["_lt"] == tag])
-    starters_sorted.extend([r for r in starters if r not in starters_sorted])
+    group_order = ["GK", "DEF", "MID", "FWD"]
+    group_titles = {
+        "GK": "🧤 GK",
+        "DEF": "🛡 DEF",
+        "MID": "⚙️ MID",
+        "FWD": "🎯 FWD"
+    }
 
-    def fmt_player(r):
-        num = (str(r["number"]) if r["number"] else "—")
-        pos = r["position_detail"] or r["position_main"]
-        return f"{num} {r['full_name']} ({pos}) {r['probability']}%"
+    def render_group(players_list, fmt_func):
+        blocks = []
+        for g in group_order:
+            items = [fmt_func(r) for r in players_list if r.get("_grp") == g]
+            if items:
+                blocks.append(group_titles[g] + ":\n" + "\n".join(items))
+        return "\n\n".join(blocks) if blocks else "—"
 
-    def block(tag, title):
-        items = [fmt_player(r) for r in starters_sorted if r.get("_lt") == tag]
-        if items:
-            return f"{title}:\n" + "\n".join(items)
-        return ""
-
-    start_blocks = [
-        block("GK", "🧤 GK"),
-        block("DEF", "🛡 DEF"),
-        block("DM", "🧱 DM"),
-        block("CM", "⚙️ CM"),
-        block("AM", "🎨 AM"),
-        block("WG", "⚡ Wings"),
-        block("CF", "🎯 CF"),
-    ]
-    start_text = "\n\n".join([b for b in start_blocks if b]) or "(нет данных)"
-
-    def fmt_out(r):
-        pos = r["position_detail"] or r["position_main"]
-        reason = r["status_reason"] or "Unavailable"
-        return f"{r['full_name']} ({pos}) — ❌ {reason}"
-
-    def fmt_bench(r):
-        pos = r["position_detail"] or r["position_main"]
-        return f"{r['full_name']} ({pos}) {r['probability']}%"
-
-    out_text = "\n".join(fmt_out(r) for r in out_players) if out_players else "—"
-    bench_text = "\n".join(fmt_bench(r) for r in bench[:15]) if bench else "—"
+    start_text = render_group(starters, _fmt_player_line)
+    out_text = render_group(out_players, _fmt_player_out)
+    bench_text = render_group(bench[:30], _fmt_player_line)
 
     lines = [
         f"Схема: {formation_code}",
