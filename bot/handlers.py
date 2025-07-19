@@ -1,4 +1,3 @@
-from bot.db.seed import force_players_reset
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from bot.db.crud import (
@@ -6,6 +5,7 @@ from bot.db.crud import (
     fetch_match_with_teams,
     fetch_team_lineup_predictions,
 )
+from bot.db.seed import force_players_reset  # если не используешь /force_seed, можешь удалить импорт
 
 LEAGUES = [
     ("Premier League", "epl"),
@@ -27,8 +27,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text("Выберите лигу:", reply_markup=markup)
     else:
-        await context.bot.send_message(chat_id=update.effective_chat.id,
-                                       text="Выберите лигу:", reply_markup=markup)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Выберите лигу:",
+            reply_markup=markup
+        )
 
 
 # ----- Назад к лигам -----
@@ -49,8 +52,10 @@ async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_
         buttons = [
             [InlineKeyboardButton("⬅ К лигам", callback_data="back_leagues")]
         ]
-        await query.edit_message_text(f"Нет доступных матчей для {league_code.upper()}",
-                                      reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text(
+            f"Нет доступных матчей для {league_code.upper()}",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
         return
 
     buttons = []
@@ -66,7 +71,7 @@ async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
-# ----- Матч → команды -----
+# ----- Матч → выбор команды -----
 async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -74,10 +79,12 @@ async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAUL
 
     match = await fetch_match_with_teams(match_id)
     if not match:
-        await query.edit_message_text("Матч не найден.",
-                                      reply_markup=InlineKeyboardMarkup(
-                                          [[InlineKeyboardButton("⬅ Лиги", callback_data="back_leagues")]]
-                                      ))
+        await query.edit_message_text(
+            "Матч не найден.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅ Лиги", callback_data="back_leagues")]]
+            )
+        )
         return
 
     buttons = [
@@ -94,7 +101,7 @@ async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAUL
     await query.edit_message_text(header, reply_markup=InlineKeyboardMarkup(buttons))
 
 
-# ----- Команда → предикт состава + статусы -----
+# ----- Команда → предикт состава -----
 async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -106,44 +113,44 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
     match_id = int(parts[1])
     team_id = int(parts[2])
 
-    preds, status_map = await fetch_team_lineup_predictions(match_id, team_id)
-    if not preds:
-        await query.edit_message_text("Нет предиктов для этой команды.",
-                                      reply_markup=InlineKeyboardMarkup(
-                                          [[InlineKeyboardButton("⬅ Назад", callback_data=f"matchdb_{match_id}")]]
-                                      ))
+    rows = await fetch_team_lineup_predictions(match_id, team_id)
+    if not rows:
+        await query.edit_message_text(
+            "Нет предиктов для этой команды.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅ Назад", callback_data=f"matchdb_{match_id}")]]
+            )
+        )
         return
 
     starters = []
     out_or_doubt = []
 
-    for pr in preds:
-        p = pr.player
-        st = status_map.get(p.id)
-        pos = p.position_detail or p.position_main
+    for r in rows:
+        pos = r["position_detail"] or r["position_main"]
         availability_tag = ""
-        if st:
-            if st.availability == "OUT":
-                availability_tag = "❌ OUT"
-            elif st.availability == "DOUBT":
-                availability_tag = "❓ Doubt"
-        base_line = f"{p.shirt_number or '-'} {p.full_name} — {pos} | {pr.probability}%"
+        if r["status_availability"] == "OUT":
+            availability_tag = "❌ OUT"
+        elif r["status_availability"] == "DOUBT":
+            availability_tag = "❓ Doubt"
+
+        line = f"{r['number'] or '-'} {r['full_name']} — {pos} | {r['probability']}%"
         if availability_tag:
-            base_line += f" | {availability_tag}"
+            line += f" | {availability_tag}"
 
-        explain = pr.explanation or ""
-        if st and st.reason:
-            explain += ("; " if explain else "") + st.reason
+        explain_parts = []
+        if r["explanation"]:
+            explain_parts.append(r["explanation"])
+        if r["status_reason"]:
+            explain_parts.append(r["status_reason"])
+        explain = "; ".join(explain_parts)
+        if explain:
+            line += "\n  " + explain
 
-        formatted = base_line + ("\n  " + explain if explain else "")
-
-        if st and st.availability in ("OUT", "DOUBT"):
-            out_or_doubt.append(formatted)
+        if r["status_availability"] in ("OUT", "DOUBT"):
+            out_or_doubt.append(line)
         else:
-            if pr.will_start:
-                starters.append(formatted)
-            else:
-                starters.append(formatted)
+            starters.append(line)
 
     text_parts = ["Предикт стартового состава:\n"]
     if starters:
@@ -158,10 +165,10 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
     ]
     await query.edit_message_text(text[:3900], reply_markup=InlineKeyboardMarkup(buttons))
 
-from bot.db.seed import force_players_reset  # импорт вверху файла
 
+# ----- (Опционально) /force_seed для перезаписи игроков/предиктов -----
 async def force_seed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Только тебе: можно ограничить по chat_id, если хочешь
-    await update.message.reply_text("⏳ Пересоздаю игроков/предикты...")
+    # Можно ограничить доступ по chat_id или username, если нужно.
+    await update.message.reply_text("⏳ Пересоздаю игроков/предикты/статусы...")
     await force_players_reset()
-    await update.message.reply_text("✅ Готово. Теперь выбери снова лигу: /start")
+    await update.message.reply_text("✅ Готово. Используй /start чтобы проверить.")
