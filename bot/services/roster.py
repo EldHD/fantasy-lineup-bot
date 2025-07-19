@@ -1,11 +1,10 @@
 from typing import List
-from sqlalchemy import select, update
+from sqlalchemy import select
 from bot.db.database import SessionLocal
 from bot.db.models import Team, Player, PlayerStatus, Tournament
 from bot.external.sofascore import (
     fetch_team_players as sofa_fetch_players,
     SOFASCORE_TEAM_IDS,
-    SofascoreError,
 )
 from bot.external.transfermarkt import (
     fetch_team_squad,
@@ -20,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 DISABLE_SOFA = os.environ.get("DISABLE_SOFASCORE") == "1"
 
+
+# ---------------- Utility ---------------- #
 
 def _normalize_name(name: str) -> str:
     return name.strip().lower()
@@ -59,12 +60,14 @@ def _detail_sofa(p: dict):
     return mapping.get(desc, desc[:12]) if desc else None
 
 
+# ---------------- Ensure Teams ---------------- #
+
 async def ensure_teams_exist(team_names: List[str], tournament_code: str):
     """
-    Создаёт команды с привязкой к турниру.
+    Создаёт недостающие команды, привязывает к турниру.
     Если турнир отсутствует – создаёт.
-    Если команда есть, но без tournament_id – ставит.
-    Возвращает количество *новых* созданных команд.
+    Если существующая команда без tournament_id – дополняем.
+    Возвращает: количество новых созданных команд.
     """
     async with SessionLocal() as session:
         # Турнир
@@ -86,7 +89,6 @@ async def ensure_teams_exist(team_names: List[str], tournament_code: str):
         for name in team_names:
             team = existing_by_name.get(name)
             if team:
-                # если уже есть, но нет привязки к турниру – дополним
                 if getattr(team, "tournament_id", None) in (None, 0):
                     team.tournament_id = tournament.id
                     repaired += 1
@@ -96,10 +98,17 @@ async def ensure_teams_exist(team_names: List[str], tournament_code: str):
 
         if created or repaired:
             await session.commit()
+            logger.info("Teams ensure: created=%s repaired=%s", created, repaired)
+
         return created
 
 
+# ---------------- Upsert Players ---------------- #
+
 async def _upsert_players(team, player_dicts):
+    """
+    Обновляем/создаём игроков. Возвращает текст отчёта.
+    """
     async with SessionLocal() as session:
         stmt = select(Player).where(Player.team_id == team.id)
         res = await session.execute(stmt)
@@ -108,8 +117,9 @@ async def _upsert_players(team, player_dicts):
 
         created = 0
         updated = 0
+
         for pd in player_dicts:
-            full_name = pd.get("full_name", "").strip()
+            full_name = (pd.get("full_name") or "").strip()
             if not full_name:
                 continue
             key = _normalize_name(full_name)
@@ -121,14 +131,14 @@ async def _upsert_players(team, player_dicts):
                 p = existing_by_name[key]
                 changed = False
                 if p.position_main != pos_main:
-                    p.position_main = pos_main; changed = True
-                if pos_detail and p.
-
-Eldar Khayretdinov, [19.07.2025 19:17]
-position_detail != pos_detail:
-                    p.position_detail = pos_detail; changed = True
+                    p.position_main = pos_main
+                    changed = True
+                if pos_detail and p.position_detail != pos_detail:
+                    p.position_detail = pos_detail
+                    changed = True
                 if number and p.shirt_number != number:
-                    p.shirt_number = number; changed = True
+                    p.shirt_number = number
+                    changed = True
                 if changed:
                     updated += 1
             else:
@@ -140,9 +150,14 @@ position_detail != pos_detail:
                     shirt_number=number
                 ))
                 created += 1
-        await session.commit()
-    return f"created={created}, updated={updated}, total_now={created+len(existing)}"
 
+        await session.commit()
+
+    total_now = created + len(existing)
+    return f"created={created}, updated={updated}, total_now={total_now}"
+
+
+# ---------------- Source: Sofascore ---------------- #
 
 async def _sync_from_sofascore(team) -> str:
     sofa_id = SOFASCORE_TEAM_IDS.get(team.name)
@@ -159,9 +174,12 @@ async def _sync_from_sofascore(team) -> str:
     ])
 
 
+# ---------------- Source: Transfermarkt ---------------- #
+
 async def _sync_from_transfermarkt(team) -> str:
     squad = await fetch_team_squad(team.name)
     report_players = await _upsert_players(team, squad)
+
     injuries = await fetch_injury_list(team.name)
     if injuries:
         async with SessionLocal() as session:
@@ -187,10 +205,17 @@ async def _sync_from_transfermarkt(team) -> str:
                 created_status += 1
             await session.commit()
         report_players += f"; statuses={created_status}"
+
     return report_players
 
 
+# ---------------- Public Sync API ---------------- #
+
 async def sync_team_roster(team_name: str):
+    """
+    Синхронизация одной команды: сначала Sofascore (если есть и не отключено),
+    затем Transfermarkt для уточнения + статусы.
+    """
     async with SessionLocal() as session:
         stmt = select(Team).where(Team.name == team_name)
         res = await session.execute(stmt)
@@ -198,7 +223,7 @@ async def sync_team_roster(team_name: str):
         if not team:
             return f"Team '{team_name}' not found."
 
-    # Sofascore (если не отключен)
+    # Sofascore (если разрешено)
     if not DISABLE_SOFA and team_name in SOFASCORE_TEAM_IDS:
         try:
             return f"{team_name} (Sofa): " + await _sync_from_sofascore(team)
@@ -213,6 +238,7 @@ async def sync_team_roster(team_name: str):
             return f"{team_name} TM error: {e}"
         except Exception as e:
             return f"{team_name} unexpected TM error: {e}"
+
     return f"{team_name}: no data source."
 
 
