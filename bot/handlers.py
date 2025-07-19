@@ -11,7 +11,6 @@ from sqlalchemy import select
 from bot.db.database import SessionLocal
 from bot.db.models import Tournament, Match, Player
 
-
 LEAGUES = [
     ("Premier League", "epl"),
     ("La Liga", "laliga"),
@@ -21,8 +20,6 @@ LEAGUES = [
     ("Russian Premier League", "rpl"),
 ]
 
-
-# ---------------- Commands ---------------- #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(name, callback_data=f"league_{code}")] for name, code in LEAGUES]
@@ -84,8 +81,6 @@ async def debug_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = text[:3800] + "\n…truncated"
     await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
 
-
-# ---------------- Navigation Callbacks ---------------- #
 
 async def back_to_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -149,13 +144,7 @@ async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAUL
     await query.edit_message_text(header, reply_markup=InlineKeyboardMarkup(buttons))
 
 
-# ---------------- Team View (Reformatted to 4 Lines) ---------------- #
-
 def _line_group_tag(r):
-    """
-    Приводим все детали к 4 укрупнённым линиям:
-    GK, DEF, MID, FWD
-    """
     d = (r["position_detail"] or "").upper()
     pm = r["position_main"]
     if pm == "goalkeeper" or d == "GK":
@@ -170,10 +159,9 @@ def _line_group_tag(r):
     if d in FWD:
         return "FWD"
     if d in WING:
-        return "MID"  # крылья считаем частью средней линии для 4-2-3-1
+        return "MID"
     if d in MID or d in MID_DEEP:
         return "MID"
-    # fallback
     if pm == "defender":
         return "DEF"
     if pm == "forward":
@@ -214,22 +202,15 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
     formation_code = "4-2-3-1"
 
-    # Разделяем категории
     raw_starters = [r for r in rows if r["will_start"] and r["status_availability"] != "OUT"]
-    # На всякий случай режем до 11
     raw_starters.sort(key=lambda r: -r["probability"])
     starters = raw_starters[:11]
-
     out_players = [r for r in rows if r["status_availability"] == "OUT"]
     bench = [r for r in rows if not r["will_start"] and r["status_availability"] != "OUT"]
 
-    # Помечаем линии 4-группово
-    for r in starters:
-        r["_grp"] = _line_group_tag(r)
-    for r in out_players:
-        r["_grp"] = _line_group_tag(r)
-    for r in bench:
-        r["_grp"] = _line_group_tag(r)
+    for group in (starters, out_players, bench):
+        for r in group:
+            r["_grp"] = _line_group_tag(r)
 
     group_order = ["GK", "DEF", "MID", "FWD"]
     group_titles = {
@@ -249,11 +230,11 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
     start_text = render_group(starters, _fmt_player_line)
     out_text = render_group(out_players, _fmt_player_out)
-    bench_text = render_group(bench[:30], _fmt_player_line)
+    bench_text = render_group(bench[:40], _fmt_player_line)
 
     lines = [
         f"Схема: {formation_code}",
-        f"✅ **Старт (11)**:",
+        "✅ **Старт (11)**:",
         start_text,
         "",
         "❌ **Не сыграют**:",
