@@ -7,6 +7,9 @@ from bot.db.crud import (
 )
 from bot.services.roster import sync_multiple_teams
 from bot.services.predictions import generate_baseline_predictions
+from sqlalchemy import select
+from bot.db.database import SessionLocal
+from bot.db.models import Tournament, Match, Player
 
 LEAGUES = [
     ("Premier League", "epl"),
@@ -17,6 +20,7 @@ LEAGUES = [
     ("Russian Premier League", "rpl"),
 ]
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(name, callback_data=f"league_{code}")] for name, code in LEAGUES]
     markup = InlineKeyboardMarkup(keyboard)
@@ -25,8 +29,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await context.bot.send_message(update.effective_chat.id, "Выберите лигу:", reply_markup=markup)
 
+
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
+
 
 async def sync_roster_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -39,6 +45,7 @@ async def sync_roster_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Roster sync:\n{rep}")
     except Exception as e:
         await update.message.reply_text(f"Roster sync failed: {e}")
+
 
 async def gen_demo_preds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
@@ -53,9 +60,6 @@ async def gen_demo_preds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     rep = await generate_baseline_predictions(match_id, team_id)
     await update.message.reply_text(rep)
 
-from sqlalchemy import select
-from bot.db.database import SessionLocal
-from bot.db.models import Tournament, Match, Player
 
 async def debug_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with SessionLocal() as session:
@@ -82,6 +86,7 @@ async def back_to_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await start(update, context)
+
 
 async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -113,6 +118,7 @@ async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ К лигам", callback_data="back_leagues")]])
         )
 
+
 async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -137,6 +143,7 @@ async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAUL
     ]
     await query.edit_message_text(header, reply_markup=InlineKeyboardMarkup(buttons))
 
+
 async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -158,6 +165,7 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
     formation_code = "4-2-3-1"
     starters = [r for r in rows if r["will_start"] and r["status_availability"] != "OUT"]
     starters.sort(key=lambda r: -r["probability"])
+    # ровно 11 (если вдруг больше)
     starters = starters[:11]
     out_players = [r for r in rows if r["status_availability"] == "OUT"]
     bench = [r for r in rows if not r["will_start"] and r["status_availability"] != "OUT"]
@@ -192,7 +200,7 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
     starters_sorted.extend([r for r in starters if r not in starters_sorted])
 
     def fmt_player(r):
-        num = (str(r["number"]) if r["number"] else "-").rjust(2)
+        num = (str(r["number"]) if r["number"] else "—")
         pos = r["position_detail"] or r["position_main"]
         return f"{num} {r['full_name']} ({pos}) {r['probability']}%"
 
