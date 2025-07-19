@@ -1,6 +1,16 @@
 import os
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler
-from bot.handlers import start, handle_league_selection
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+)
+from bot.handlers import (
+    start,
+    handle_league_selection,
+    handle_match_selection,
+    handle_team_selection,
+    show_leagues
+)
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 
@@ -8,7 +18,10 @@ def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_league_selection, pattern=r'^league_'))
+    app.add_handler(CallbackQueryHandler(show_leagues, pattern="^choose_league$"))
+    app.add_handler(CallbackQueryHandler(handle_league_selection, pattern=r"^league_"))
+    app.add_handler(CallbackQueryHandler(handle_match_selection, pattern=r"^match_"))
+    app.add_handler(CallbackQueryHandler(handle_team_selection, pattern=r"^team_"))
 
     print("Bot started (polling)...")
     app.run_polling()
