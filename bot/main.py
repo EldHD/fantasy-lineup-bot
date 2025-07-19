@@ -40,6 +40,7 @@ def main():
 
     # Регистрируем handlers
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("force_seed", force_seed_cmd))
     application.add_handler(CallbackQueryHandler(back_to_leagues, pattern=r"^back_leagues$"))
     application.add_handler(CallbackQueryHandler(handle_league_selection, pattern=r"^league_"))
     application.add_handler(CallbackQueryHandler(handle_db_match_selection, pattern=r"^matchdb_"))
