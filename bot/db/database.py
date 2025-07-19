@@ -1,12 +1,16 @@
 import os
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
-DATABASE_URL = os.environ["DATABASE_URL"]
+DATABASE_URL = os.environ["DATABASE_URL"]  # формат: postgresql+asyncpg://...
 
 engine = create_async_engine(
     DATABASE_URL,
-    echo=False,          # поставь True если хочешь видеть SQL в логах
+    echo=False,
+    future=True,
     pool_pre_ping=True,
 )
 
-SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+SessionLocal = async_sessionmaker(
+    engine,
+    expire_on_commit=False,
+)
