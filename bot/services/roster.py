@@ -2,7 +2,7 @@ from typing import List, Optional
 from sqlalchemy import select
 from bot.db.database import SessionLocal
 from bot.db.models import Team, Player
-from bot.external.sofascore import fetch_team_players, SOFASCORE_TEAM_IDS
+from bot.external.sofascore import fetch_team_players, SOFASCORE_TEAM_IDS, SofascoreError
 
 POS_MAP_MAIN = {
     "G": "goalkeeper",
@@ -43,6 +43,10 @@ def map_main(pos_raw: str) -> str:
 
 
 async def sync_team_roster(team_name: str):
+    """
+    Синхронизирует игроков одной команды.
+    Возвращает строку-результат (для отображения пользователю).
+    """
     async with SessionLocal() as session:
         stmt = select(Team).where(Team.name == team_name)
         res = await session.execute(stmt)
@@ -54,7 +58,13 @@ async def sync_team_roster(team_name: str):
         if not sofa_id:
             return f"No Sofascore ID mapped for '{team.name}'"
 
-        players_raw = await fetch_team_players(sofa_id)
+        try:
+            players_raw = await fetch_team_players(sofa_id)
+        except SofascoreError as e:
+            return f"Sofascore error for {team.name}: {e}"
+        except Exception as e:
+            return f"Unexpected error for {team.name}: {e}"
+
         created = 0
         updated = 0
 
