@@ -1,52 +1,42 @@
 import os
 
-# ---------- Интервалы и задержки для фоновых задач (JobQueue) ----------
-# Периодичность синка ростеров (в секундах). По умолчанию 6 часов.
-SYNC_INTERVAL_SEC = int(os.environ.get("SYNC_INTERVAL_SEC", str(6 * 60 * 60)))  # 21600
+# Telegram
+BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN") or os.environ.get("BOT_TOKEN")
 
-# Периодичность генерации предиктов (в секундах). По умолчанию 6ч + 10 минут.
-PREDICT_INTERVAL_SEC = int(os.environ.get("PREDICT_INTERVAL_SEC", str(6 * 60 * 60 + 600)))  # 22200
+# Интервалы (секунды)
+def _int(name: str, default: int) -> int:
+    try:
+        v = int(os.environ.get(name, "").strip())
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    return default
 
-# Задержка перед первым автоматическим синком (сек)
-FIRST_SYNC_DELAY = int(os.environ.get("FIRST_SYNC_DELAY", "10"))
+SYNC_INTERVAL_SEC = _int("SYNC_INTERVAL_SEC", 6 * 60 * 60)          # 6 часов
+PREDICT_INTERVAL_SEC = _int("PREDICT_INTERVAL_SEC", 6 * 60 * 60 + 600)  # 6ч10м
 
-# Задержка перед первой автогенерацией предиктов (сек)
-FIRST_PREDICT_DELAY = int(os.environ.get("FIRST_PREDICT_DELAY", "40"))
+# Пауза между запросами к Transfermarkt (сек)
+TM_DELAY_BASE = float(os.environ.get("TM_DELAY_BASE", "3.0"))
 
-# Установи DISABLE_JOBS=1 в переменных окружения, если хочешь полностью отключить автозадачи.
-DISABLE_JOBS = os.environ.get("DISABLE_JOBS", "0") == "1"
+# Лимит игроков на парсинг (страховочный)
+MAX_PLAYERS_PER_TEAM = int(os.environ.get("MAX_PLAYERS_PER_TEAM", "60"))
 
-# ---------- Константы турнир / охват ----------
-EPL_TOURNAMENT_CODE = "epl"
+# Включить / отключить Sofascore (1 = отключить)
+DISABLE_SOFASCORE = os.environ.get("DISABLE_SOFASCORE") == "1"
 
-# Сколько дней вперёд генерировать предикты (для job_generate_predictions)
-PREDICT_DAYS_AHEAD = int(os.environ.get("PREDICT_DAYS_AHEAD", "7"))
-
-# Полный список команд EPL (поддерживаемый синк)
+# Лиги / команды (упрощённо; для EPL полный список)
 EPL_TEAM_NAMES = [
-    "Arsenal",
-    "Aston Villa",
-    "Bournemouth",
-    "Brentford",
-    "Brighton & Hove Albion",
-    "Chelsea",
-    "Crystal Palace",
-    "Everton",
-    "Fulham",
-    "Ipswich Town",
-    "Leicester City",
-    "Liverpool",
-    "Manchester City",
-    "Manchester United",
-    "Newcastle United",
-    "Nottingham Forest",
-    "Southampton",
-    "Tottenham Hotspur",
-    "West Ham United",
-    "Wolverhampton Wanderers",
+    "Arsenal", "Aston Villa", "Bournemouth", "Brentford", "Brighton & Hove Albion",
+    "Chelsea", "Crystal Palace", "Everton", "Fulham", "Ipswich Town",
+    "Leicester City", "Liverpool", "Manchester City", "Manchester United",
+    "Newcastle United", "Nottingham Forest", "Southampton",
+    "Tottenham Hotspur", "West Ham United", "Wolverhampton Wanderers"
 ]
 
-# Можно позже добавить аналогичные списки для других лиг:
-# LALIGA_TEAM_NAMES = [...]
-# SERIEA_TEAM_NAMES = [...]
-# и т.д.
+# Маппинг кода турнира → список команд (можно расширять)
+TOURNAMENT_TEAMS = {
+    "epl": EPL_TEAM_NAMES,
+    # "laliga": [...],
+    # "rpl": [...],
+}
