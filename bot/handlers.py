@@ -5,6 +5,8 @@ from bot.db.crud import (
     fetch_match_with_teams,
     fetch_team_lineup_predictions,
 )
+from bot.services.roster import sync_multiple_teams
+from bot.services.predictions import generate_baseline_predictions
 
 LEAGUES = [
     ("Premier League", "epl"),
@@ -22,14 +24,10 @@ TEAM_FORMATIONS = {
     "CSKA Moscow": ["4-3-3"],
 }
 
+# ---------- Утилиты схемы ----------
 def parse_formation(code: str):
     parts = [int(p) for p in code.split("-")]
-    return {
-        "code": code,
-        "def": parts[0],
-        "mid": sum(parts[1:-1]),
-        "fwd": parts[-1],
-    }
+    return {"code": code, "def": parts[0], "mid": sum(parts[1:-1]), "fwd": parts[-1]}
 
 def classify_role(row, formation_meta):
     pos_main = (row["position_main"] or "").lower()
@@ -55,7 +53,7 @@ def classify_role(row, formation_meta):
     return "midfielder"
 
 
-# -------- /start ----------
+# ---------- Команды ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton(name, callback_data=f"league_{code}")] for name, code in LEAGUES]
     markup = InlineKeyboardMarkup(keyboard)
@@ -64,21 +62,69 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await context.bot.send_message(update.effective_chat.id, "Выберите лигу:", reply_markup=markup)
 
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong")
 
+async def sync_roster_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /sync_roster  (или /sync_roster Arsenal,Chelsea)
+    if context.args:
+        team_names = " ".join(context.args).split(",")
+        team_names = [t.strip() for t in team_names if t.strip()]
+    else:
+        team_names = ["Arsenal", "Chelsea"]
+    rep = await sync_multiple_teams(team_names)
+    await update.message.reply_text(f"Roster sync:\n{rep}")
+
+async def gen_demo_preds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /gen_demo_preds <match_id> <team_id>
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /gen_demo_preds <match_id> <team_id>")
+        return
+    try:
+        match_id = int(context.args[0])
+        team_id = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("IDs must be integers.")
+        return
+    rep = await generate_baseline_predictions(match_id, team_id)
+    await update.message.reply_text(rep)
+
+# (опционально) /debugdb
+from sqlalchemy import select
+from bot.db.database import SessionLocal
+from bot.db.models import Tournament, Match, Team, Player
+
+async def debug_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async with SessionLocal() as session:
+        t_res = await session.execute(select(Tournament))
+        tournaments = t_res.scalars().all()
+        m_res = await session.execute(select(Match))
+        matches = m_res.scalars().all()
+        p_res = await session.execute(select(Player))
+        players = p_res.scalars().all()
+    lines = ["Tournaments:"]
+    for t in tournaments:
+        lines.append(f"- {t.id} {t.code} {t.name}")
+    lines.append("Matches:")
+    for m in matches:
+        lines.append(f"- {m.id} t={m.tournament_id} {m.round} ko={m.utc_kickoff} home={m.home_team_id} away={m.away_team_id}")
+    lines.append(f"Players total: {len(players)}")
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3800] + "\n…truncated"
+    await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
+
+# ---------- Навигация ----------
 async def back_to_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await start(update, context)
 
-
-# -------- Лига ----------
 async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    raw = query.data
-    league_code = raw.split("_", 1)[1]
+    league_code = query.data.split("_", 1)[1]
     print(f"[CALLBACK] league_code={league_code}")
-
     try:
         matches = await fetch_matches_by_league(league_code)
         if not matches:
@@ -88,40 +134,29 @@ async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_
                 reply_markup=InlineKeyboardMarkup(buttons)
             )
             return
-
         buttons = []
         for m in matches:
-            kickoff = m["utc_kickoff"]
-            # Подстрахуемся: если не datetime — просто строкой
-            if hasattr(kickoff, "strftime"):
-                ko_txt = kickoff.strftime("%Y-%m-%d %H:%M UTC")
-            else:
-                ko_txt = str(kickoff)
+            ko = m["utc_kickoff"]
+            ko_txt = ko.strftime("%Y-%m-%d %H:%M UTC") if hasattr(ko, "strftime") else str(ko)
             txt = f"{m['home_team_name']} vs {m['away_team_name']} • {ko_txt}"
             buttons.append([InlineKeyboardButton(txt, callback_data=f"matchdb_{m['id']}")])
-
         buttons.append([InlineKeyboardButton("⬅ К лигам", callback_data="back_leagues")])
         await query.edit_message_text(
             f"Матчи ({league_code.upper()}):",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
     except Exception as e:
-        # Лог в консоль
         print(f"[ERROR] handle_league_selection {league_code}: {e}")
         import traceback; traceback.print_exc()
-        # Сообщение пользователю
         await query.edit_message_text(
             f"Произошла ошибка при загрузке матчей для {league_code.upper()} :(",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ К лигам", callback_data="back_leagues")]])
         )
 
-
-# -------- Матч ----------
 async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     match_id = int(query.data.split("_", 1)[1])
-    print(f"[CALLBACK] match_id={match_id}")
     match = await fetch_match_with_teams(match_id)
     if not match:
         await query.edit_message_text(
@@ -129,21 +164,20 @@ async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAUL
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Лиги", callback_data="back_leagues")]])
         )
         return
+    header = (
+        f"Match ID: {match['id']}\n"
+        f"{match['home']['name']} (team {match['home']['id']}) vs {match['away']['name']} (team {match['away']['id']})\n"
+        f"{match['round']}\n"
+        f"Kickoff: {match['utc_kickoff']:%Y-%m-%d %H:%M UTC}\n\nВыберите команду:"
+    )
     buttons = [
         [InlineKeyboardButton(match["home"]["name"], callback_data=f"teamdb_{match['id']}_{match['home']['id']}")],
         [InlineKeyboardButton(match["away"]["name"], callback_data=f"teamdb_{match['id']}_{match['away']['id']}")],
         [InlineKeyboardButton("⬅ Матчи", callback_data=f"league_{match['tournament_code']}")],
         [InlineKeyboardButton("🏁 Лиги", callback_data="back_leagues")]
     ]
-    header = (
-        f"{match['home']['name']} vs {match['away']['name']}\n"
-        f"{match['round']}\n"
-        f"Kickoff: {match['utc_kickoff']:%Y-%m-%d %H:%M UTC}\n\nВыберите команду:"
-    )
     await query.edit_message_text(header, reply_markup=InlineKeyboardMarkup(buttons))
 
-
-# -------- Команда / предикт ----------
 async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -153,7 +187,6 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
         return
     match_id = int(parts[1])
     team_id = int(parts[2])
-    print(f"[CALLBACK] team selection match={match_id} team={team_id}")
 
     rows = await fetch_team_lineup_predictions(match_id, team_id)
     if not rows:
@@ -186,7 +219,6 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
     doubt_sorted = base_sort(doubt_players)
 
     starters = []
-    # GK
     gk_ok = [r for r in ok_sorted if r["_role"] == "goalkeeper"]
     gk_doubt = [r for r in doubt_sorted if r["_role"] == "goalkeeper"]
     if gk_ok: starters.append(gk_ok[0])
@@ -270,13 +302,7 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
-
-# --- Диагностическая команда ---
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong")
-
-
-# --- Catch-all логгер (временно) ---
+# Catch-all (отладка)
 async def debug_catch_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         print("[CATCH-ALL] data =", update.callback_query.data)
