@@ -5,7 +5,8 @@ from bot.db.crud import (
     fetch_match_with_teams,
     fetch_team_lineup_predictions,
 )
-from bot.db.seed import force_players_reset  # если не используешь /force_seed, можешь удалить импорт
+from bot.db.seed import force_players_reset  # оставь, если используешь /force_seed
+
 
 LEAGUES = [
     ("Premier League", "epl"),
@@ -49,9 +50,7 @@ async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_
 
     matches = await fetch_matches_by_league(league_code)
     if not matches:
-        buttons = [
-            [InlineKeyboardButton("⬅ К лигам", callback_data="back_leagues")]
-        ]
+        buttons = [[InlineKeyboardButton("⬅ К лигам", callback_data="back_leagues")]]
         await query.edit_message_text(
             f"Нет доступных матчей для {league_code.upper()}",
             reply_markup=InlineKeyboardMarkup(buttons)
@@ -60,8 +59,8 @@ async def handle_league_selection(update: Update, context: ContextTypes.DEFAULT_
 
     buttons = []
     for m in matches:
-        txt = f"{m.home_team.name} vs {m.away_team.name} • {m.utc_kickoff:%Y-%m-%d %H:%M UTC}"
-        buttons.append([InlineKeyboardButton(txt, callback_data=f"matchdb_{m.id}")])
+        txt = f"{m['home_team_name']} vs {m['away_team_name']} • {m['utc_kickoff']:%Y-%m-%d %H:%M UTC}"
+        buttons.append([InlineKeyboardButton(txt, callback_data=f"matchdb_{m['id']}")])
 
     buttons.append([InlineKeyboardButton("⬅ К лигам", callback_data="back_leagues")])
 
@@ -88,15 +87,15 @@ async def handle_db_match_selection(update: Update, context: ContextTypes.DEFAUL
         return
 
     buttons = [
-        [InlineKeyboardButton(match.home_team.name, callback_data=f"teamdb_{match.id}_{match.home_team.id}")],
-        [InlineKeyboardButton(match.away_team.name, callback_data=f"teamdb_{match.id}_{match.away_team.id}")],
-        [InlineKeyboardButton("⬅ Матчи", callback_data=f"league_{match.tournament.code}")],
+        [InlineKeyboardButton(match["home"]["name"], callback_data=f"teamdb_{match['id']}_{match['home']['id']}")],
+        [InlineKeyboardButton(match["away"]["name"], callback_data=f"teamdb_{match['id']}_{match['away']['id']}")],
+        [InlineKeyboardButton("⬅ Матчи", callback_data=f"league_{match['tournament_code']}")],
         [InlineKeyboardButton("🏁 Лиги", callback_data="back_leagues")]
     ]
     header = (
-        f"{match.home_team.name} vs {match.away_team.name}\n"
-        f"{match.round}\n"
-        f"Kickoff: {match.utc_kickoff:%Y-%m-%d %H:%M UTC}\n\nВыберите команду:"
+        f"{match['home']['name']} vs {match['away']['name']}\n"
+        f"{match['round']}\n"
+        f"Kickoff: {match['utc_kickoff']:%Y-%m-%d %H:%M UTC}\n\nВыберите команду:"
     )
     await query.edit_message_text(header, reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -166,9 +165,8 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(text[:3900], reply_markup=InlineKeyboardMarkup(buttons))
 
 
-# ----- (Опционально) /force_seed для перезаписи игроков/предиктов -----
+# ----- /force_seed (опционально) -----
 async def force_seed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Можно ограничить доступ по chat_id или username, если нужно.
     await update.message.reply_text("⏳ Пересоздаю игроков/предикты/статусы...")
     await force_players_reset()
-    await update.message.reply_text("✅ Готово. Используй /start чтобы проверить.")
+    await update.message.reply_text("✅ Готово. /start")
