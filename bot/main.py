@@ -10,6 +10,7 @@ from bot.handlers import (
     handle_db_match_selection,
     handle_team_selection,
     back_to_leagues,
+    force_seed_cmd, 
 )
 from bot.db.seed import auto_seed
 
