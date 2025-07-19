@@ -5,9 +5,29 @@ import re
 from selectolax.parser import HTMLParser
 from typing import Optional, List, Dict
 
+# Transfermarkt IDs EPL 24/25 (проверка актуальности может понадобиться позже)
 TRANSFERMARKT_TEAM_IDS = {
     "Arsenal": 11,
+    "Aston Villa": 405,
+    "Bournemouth": 989,
+    "Brentford": 1148,
+    "Brighton & Hove Albion": 1237,
     "Chelsea": 631,
+    "Crystal Palace": 873,
+    "Everton": 29,
+    "Fulham": 931,
+    "Ipswich Town": 677,
+    "Leicester City": 1003,
+    "Liverpool": 31,
+    "Manchester City": 281,
+    "Manchester United": 985,
+    "Newcastle United": 762,
+    "Nottingham Forest": 703,
+    "Southampton": 180,
+    "Tottenham Hotspur": 148,
+    "West Ham United": 379,
+    "Wolverhampton Wanderers": 543,
+    # Уже существовавшие вне EPL:
     "Zenit": 964,
     "CSKA Moscow": 2410,
 }
@@ -119,7 +139,8 @@ def _extract_position_from_row(row):
     for idx_guess in (4, 5, 6):
         if idx_guess < len(tds):
             guess_text = _clean(tds[idx_guess].text())
-            if any(k in guess_text.lower() for k in ["midfield", "back", "wing", "forward", "striker", "keeper"]):
+            if any(k in guess_text.lower() for k in
+                   ["midfield", "back", "wing", "forward", "striker", "keeper"]):
                 return guess_text
     return ""
 
@@ -161,23 +182,18 @@ async def fetch_team_squad(team_name: str):
 
 def _normalize_reason(player_name: str, raw_reason: str) -> str:
     reason = _clean(raw_reason)
-    # Убираем повтор имени
     if reason.lower() == player_name.lower():
         reason = ""
-    # Если пусто или коротко
     if not reason or len(reason) < 3:
         reason = "Injury (unspecified)"
-    # Признаки дисквалификации
     low = reason.lower()
     if any(k in low for k in ["suspens", "yellow", "red", "disciplin", "ban"]):
-        # Нормализуем
         if "yellow" in low:
             reason = "Suspension (yellow cards)"
         elif "red" in low:
             reason = "Suspension (red card)"
         else:
             reason = "Suspension"
-    # Капитализация – уже нормальная, просто возвращаем
     return reason
 
 
@@ -210,13 +226,3 @@ async def fetch_injury_list(team_name: str):
                 "reason": reason,
             })
     return out_list
-
-
-if __name__ == "__main__":
-    async def _t():
-        sq = await fetch_team_squad("Arsenal")
-        print("Players:", len(sq))
-        print(sq[:5])
-        inj = await fetch_injury_list("Arsenal")
-        print("Injuries:", inj)
-    asyncio.run(_t())
