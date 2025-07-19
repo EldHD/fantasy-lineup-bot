@@ -3,9 +3,11 @@ from sqlalchemy import select
 from .database import engine, SessionLocal
 from .models import Base, Tournament, Team, Match
 
+
 async def _create_schema():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
 
 async def _seed_minimal(session):
     exists = await session.execute(select(Tournament.id).limit(1))
@@ -42,6 +44,7 @@ async def _seed_minimal(session):
     session.add_all([m1, m2])
     await session.flush()
     return True
+
 
 async def auto_seed():
     await _create_schema()
