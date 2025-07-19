@@ -1,78 +1,64 @@
 import os
+import logging
+import asyncio
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
 )
 from bot.handlers import (
     start,
+    ping,
+    sync_roster_cmd,
+    gen_demo_preds_cmd,
     handle_league_selection,
     handle_db_match_selection,
     handle_team_selection,
     back_to_leagues,
-    ping,
-    debug_catch_all,
-    sync_roster_cmd,
-    gen_demo_preds_cmd,
     debug_db,
+    resync_all_cmd,
+    export_lineup_cmd,
 )
-from bot.db.seed import auto_seed
+from bot.services.scheduler import start_scheduler
+from bot.config import ENABLE_SCHEDULER
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]  # проверь название переменной
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-
-async def post_init(app: Application):
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        print("Webhook cleared.")
-    except Exception as e:
-        print("Webhook clear err:", e)
-    await auto_seed()
-    print("DB init / seed complete.")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 
-async def error_handler(update, context):
-    import traceback, sys
-    print("=== ERROR HANDLER START ===")
-    print("Update:", update)
-    print("Exception:", context.error)
-    traceback.print_exception(type(context.error), context.error, context.error.__traceback__, file=sys.stdout)
-    print("=== ERROR HANDLER END ===")
-    try:
-        if update and hasattr(update, "callback_query") and update.callback_query:
-            await update.callback_query.edit_message_text("⚠️ Внутренняя ошибка. Попробуйте ещё раз.")
-        elif update and update.effective_chat:
-            await context.bot.send_message(update.effective_chat.id, "⚠️ Ошибка обработчика.")
-    except Exception:
-        pass
+def build_app():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CommandHandler("sync_roster", sync_roster_cmd))
+    app.add_handler(CommandHandler("resync_all", resync_all_cmd))
+    app.add_handler(CommandHandler("gen_demo_preds", gen_demo_preds_cmd))
+    app.add_handler(CommandHandler("export_lineup", export_lineup_cmd))
+    app.add_handler(CommandHandler("debugdb", debug_db))
+
+    # Callback query handlers
+    app.add_handler(CallbackQueryHandler(back_to_leagues, pattern="^back_leagues$"))
+    app.add_handler(CallbackQueryHandler(handle_league_selection, pattern="^league_"))
+    app.add_handler(CallbackQueryHandler(handle_db_match_selection, pattern="^matchdb_"))
+    app.add_handler(CallbackQueryHandler(handle_team_selection, pattern="^teamdb_"))
+
+    return app
 
 
 def main():
-    application = (
-        Application.builder()
-        .token(TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    # Команды
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("ping", ping))
-    application.add_handler(CommandHandler("sync_roster", sync_roster_cmd))
-    application.add_handler(CommandHandler("gen_demo_preds", gen_demo_preds_cmd))
-    application.add_handler(CommandHandler("debugdb", debug_db))
-
-    # Callback-и
-    application.add_handler(CallbackQueryHandler(back_to_leagues, pattern=r"^back_leagues$"))
-    application.add_handler(CallbackQueryHandler(handle_league_selection, pattern=r"^league_"))
-    application.add_handler(CallbackQueryHandler(handle_db_match_selection, pattern=r"^matchdb_"))
-    application.add_handler(CallbackQueryHandler(handle_team_selection, pattern=r"^teamdb_"))
-    application.add_handler(CallbackQueryHandler(debug_catch_all))  # должен идти последним
-
-    application.add_error_handler(error_handler)
-
-    print("Starting bot (polling)...")
-    application.run_polling(drop_pending_updates=True)
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN not set")
+    app = build_app()
+    scheduler = start_scheduler()
+    if ENABLE_SCHEDULER:
+        logger.info("Scheduler enabled.")
+    else:
+        logger.info("Scheduler disabled (set ENABLE_SCHEDULER=1 to enable).")
+    app.run_polling()
 
 
 if __name__ == "__main__":
