@@ -1,3 +1,4 @@
+from bot.db.seed import force_players_reset
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from bot.db.crud import (
@@ -156,3 +157,11 @@ async def handle_team_selection(update: Update, context: ContextTypes.DEFAULT_TY
         [InlineKeyboardButton("🏁 Лиги", callback_data="back_leagues")]
     ]
     await query.edit_message_text(text[:3900], reply_markup=InlineKeyboardMarkup(buttons))
+
+from bot.db.seed import force_players_reset  # импорт вверху файла
+
+async def force_seed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Только тебе: можно ограничить по chat_id, если хочешь
+    await update.message.reply_text("⏳ Пересоздаю игроков/предикты...")
+    await force_players_reset()
+    await update.message.reply_text("✅ Готово. Теперь выбери снова лигу: /start")
