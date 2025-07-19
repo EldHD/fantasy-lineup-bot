@@ -22,20 +22,21 @@ async def generate_baseline_predictions(match_id: int, team_id: int):
             return f"No players for team {team_id}."
 
         role_order = {"goalkeeper": 0, "defender": 1, "midfielder": 2, "forward": 3}
-        players.sort(key=lambda p: (role_order.get(p.position_main, 9),
-                                    (p.shirt_number or 999),
-                                    p.full_name.lower()))
+        players.sort(key=lambda p: (
+            role_order.get(p.position_main, 9),
+            (p.shirt_number or 999),
+            p.full_name.lower()
+        ))
 
         starters = []
-        # гарантированно 1 GK
         gk = [p for p in players if p.position_main == "goalkeeper"]
         if gk:
             starters.append(gk[0])
 
-        def pick(role, needed):
+        def pick(role, need):
             nonlocal starters
             pool = [p for p in players if p.position_main == role and p not in starters]
-            starters.extend(pool[:needed])
+            starters.extend(pool[:need])
 
         pick("defender", 4)
         pick("midfielder", 5)
@@ -47,7 +48,6 @@ async def generate_baseline_predictions(match_id: int, team_id: int):
 
         starter_ids = {p.id for p in starters}
 
-        # Удалим старые предикты для этого матча и этой команды
         del_stmt = delete(Prediction).where(Prediction.match_id == match_id)
         await session.execute(del_stmt)
         await session.flush()
