@@ -1,38 +1,46 @@
 import logging
 import time
-from typing import List, Dict, Optional
+from typing import List, Dict, Tuple, Optional
 
-from bot.external.sofascore import fetch_league_matches
+from bot.external.sofascore import fetch_league_matches_with_meta
 
 logger = logging.getLogger(__name__)
 
-# In-memory кэш
 _CACHE: Dict[str, dict] = {}
 CACHE_TTL_SEC = 60 * 10  # 10 минут
 
-
-async def get_upcoming_matches_for_league(league_code: str, limit: int = 8) -> List[Dict]:
+async def get_upcoming_matches_for_league(league_code: str, limit: int = 8) -> Tuple[List[Dict], dict]:
     """
-    Получить кэшированные ближайшие матчи.
-    Если кэш свежий – берём из него, иначе тянем заново.
+    Возвращает (matches, meta).
+    Кэшируем и матчи, и мета-информацию.
     """
     now = time.time()
     cached = _CACHE.get(league_code)
     if cached and (now - cached["ts"] < CACHE_TTL_SEC):
-        logger.debug("Matches cache hit for %s (items=%d)", league_code, len(cached['data']))
-        data = cached["data"]
+        logger.debug("Matches cache hit for %s (items=%d)", league_code, len(cached["matches"]))
+        matches = cached["matches"]
+        meta = cached["meta"]
     else:
         logger.debug("Matches cache miss for %s – fetching...", league_code)
         try:
-            data = await fetch_league_matches(league_code, limit=limit)
+            matches, meta = await fetch_league_matches_with_meta(league_code, limit=limit)
         except Exception as e:
-            logger.exception("fetch_league_matches error for %s: %s", league_code, e)
-            data = []
-        _CACHE[league_code] = {"ts": now, "data": data}
+            logger.exception("fetch_league_matches_with_meta error for %s", league_code)
+            matches, meta = [], {
+                "league_code": league_code,
+                "reason": f"Внутренняя ошибка: {e}",
+                "requests": [],
+                "link": None
+            }
+        _CACHE[league_code] = {
+            "ts": now,
+            "matches": matches,
+            "meta": meta
+        }
 
-    if len(data) > limit:
-        return data[:limit]
-    return data
+    if limit and len(matches) > limit:
+        matches = matches[:limit]
+    return matches, meta
 
 
 def clear_matches_cache(league_code: Optional[str] = None):
