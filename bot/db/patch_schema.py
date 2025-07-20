@@ -1,15 +1,15 @@
 """
-Непривязанный к loop модуль: даёт корутину apply_async(),
-которую вызываем из main.py на уже выбранном event-loop.
+Патч схемы БД перед стартом бота.
+Работает на уже открытом event-loop (см. main.py).
 """
 import logging
 from sqlalchemy import text, inspect
-
 from .database import engine
 
 log = logging.getLogger(__name__)
 
-_PATCHES: list[tuple[str, str, str]] = [
+# ➊  список «таблица, колонка, DDL» – можете пополнять по мере нужды
+PATCHES: list[tuple[str, str, str]] = [
     ("matches", "status",
      "ALTER TABLE matches ADD COLUMN status VARCHAR(20) DEFAULT 'scheduled'"),
     ("matches", "matchday",
@@ -18,22 +18,21 @@ _PATCHES: list[tuple[str, str, str]] = [
 
 
 async def apply_async() -> None:
-    """Добавляем отсутствующие столбцы."""
-    async with engine.begin() as conn:
+    """Добавляет отсутствующие колонки (idempotent)."""
+    async with engine.begin() as async_conn:
 
         async def _sync(sync_conn):
             insp = inspect(sync_conn)
-            tables = insp.get_table_names()
+            existing = {
+                table: {c["name"] for c in insp.get_columns(table)}
+                for table in insp.get_table_names()
+            }
 
-            for table, col, ddl in _PATCHES:
-                if table not in tables:
-                    log.warning("table %s missing – skip", table)
+            for table, col, ddl in PATCHES:
+                if col in existing.get(table, set()):
+                    log.debug("✓ %s.%s уже есть", table, col)
                     continue
-                if col in {c["name"] for c in insp.get_columns(table)}:
-                    log.info("column %s.%s already exists", table, col)
-                    continue
-
-                log.info("apply patch → %s", ddl)
+                log.info("➕ apply patch: %s", ddl)
                 sync_conn.execute(text(ddl))
 
-        await conn.run_sync(_sync)
+        await async_conn.run_sync(_sync)
