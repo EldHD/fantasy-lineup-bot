@@ -1,38 +1,40 @@
 import logging
+import time
 from typing import List, Dict
 
-from bot.external.tm_fixtures import fetch_league_fixtures, TMFixturesError
+from bot.external.sofascore import fetch_league_matches
 
 logger = logging.getLogger(__name__)
 
-# Обёртка: сейчас не ходим в БД – просто парсим.
-# Потом сюда добавим сохранение и кэш.
+# Простой in-memory кэш (процессный). На прод с несколькими инстансами нужна БД/redis.
+_CACHE: Dict[str, dict] = {}
+CACHE_TTL_SEC = 60 * 10  # 10 минут
 
-async def get_upcoming_matches_for_league(
-    league_code: str,
-    max_show: int = 12,
-) -> List[Dict]:
+
+async def get_upcoming_matches_for_league(league_code: str, limit: int = 8) -> List[Dict]:
     """
-    Возвращает список ближайших (по порядку туров) матчей для лиги.
-    Пока просто вытаскивает первые matchdays (до 5 максимум) и фильтрует будущие/с датой.
+    Возвращает (с кэшем) список ближайших матчей.
     """
+    now = time.time()
+    cached = _CACHE.get(league_code)
+    if cached and (now - cached["ts"] < CACHE_TTL_SEC):
+        return cached["data"]
+
     try:
-        all_matches = await fetch_league_fixtures(league_code, start_matchday=1, max_matchdays=5)
-    except TMFixturesError as e:
-        logger.error("Fixtures parse error for %s: %s", league_code, e)
-        return []
+        data = await fetch_league_matches(league_code, limit=limit)
+    except Exception as e:
+        logger.exception("Failed to fetch matches for %s: %s", league_code, e)
+        data = []
 
-    # Сортируем по matchday и дате (если есть)
-    def sort_key(m):
-        return (
-            m.get("matchday") or 9999,
-            m.get("kickoff_utc") or m.get("matchday"),
-            m.get("home_team"),
-        )
+    _CACHE[league_code] = {"ts": now, "data": data}
+    return data
 
-    all_matches.sort(key=sort_key)
 
-    if len(all_matches) > max_show:
-        all_matches = all_matches[:max_show]
-
-    return all_matches
+def clear_matches_cache(league_code: str | None = None):
+    """
+    Опционально: очистка кэша (можно вызвать из команды админа).
+    """
+    if league_code:
+        _CACHE.pop(league_code, None)
+    else:
+        _CACHE.clear()
