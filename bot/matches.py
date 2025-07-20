@@ -61,15 +61,33 @@ def render_no_matches_error(league_code: str, err: dict) -> str:
     msg = err.get("message")
     if msg:
         base.append(f"Причина: {msg}")
-    if err.get("status"):
-        base.append(f"HTTP статус: {err['status']}")
-    if err.get("url"):
-        base.append(f"URL: {err['url']}")
+
     season_year = err.get("season_year")
     if season_year:
         base.append(f"Season start year: {season_year}")
-    if err.get("parsed_total") is not None:
-        base.append(f"Всего распознано матчей: {err['parsed_total']}")
-    base.append("Источник: Transfermarkt (full season page)")
-    base.append("Советы: проверь опубликован ли календарь, попробуйте другой TM_SEASON_YEAR, позже или другой IP.")
+
+    attempts = err.get("attempts") or []
+    if attempts:
+        base.append("Попытки:")
+        for a in attempts:
+            url = a.get("url")
+            st = a.get("status")
+            if "error" in a:
+                base.append(f" - {url} | status={st} | error={a['error']}")
+            else:
+                base.append(
+                    f" - {url} | status={st} | spielbericht={a.get('spielbericht_links')} "
+                    f"| team_rows={a.get('team_rows')} | parsed={a.get('parsed_matches')}"
+                )
+    errors = err.get("errors")
+    if errors:
+        base.append("Ошибки (первые):")
+        for e in errors:
+            base.append(f"   * {e}")
+
+    if err.get("debug"):
+        base.append(f"DEBUG: {err['debug']}")
+
+    base.append("Источник: Transfermarkt (gesamtspielplan)")
+    base.append("Советы: проверь опубликован ли календарь / TM_SEASON_YEAR / позже / другой IP / включи TM_CALENDAR_DEBUG=1 для доп. отладки.")
     return "\n".join(base)
