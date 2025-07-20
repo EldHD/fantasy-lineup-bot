@@ -1,27 +1,66 @@
+# bot/handlers.py
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes, CommandHandler, CallbackQueryHandler
-from bot.matches import load_and_store_next_md
+from telegram.ext import (
+    ContextTypes, Application, CommandHandler, CallbackQueryHandler
+)
+from sqlalchemy import select
+from bot.db.database import async_session
+from bot.db.models   import Tournament, Match
 
-def register_handlers(app):
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CallbackQueryHandler(callback_router))
 
-async def start_cmd(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Premier League", callback_data="epl")]
-    ])
-    await upd.effective_chat.send_message("Выберите лигу:", reply_markup=kb)
+LEAGUES = {"Premier League": "epl"}     # + добавите остальные коды
 
-async def callback_router(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    league = upd.callback_query.data
-    await upd.callback_query.answer()
-    matches = await load_and_store_next_md(league)
+
+# ──────────────────────────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [[InlineKeyboardButton(txt, callback_data=f"league:{code}")]
+          for txt, code in LEAGUES.items()]
+    await update.message.reply_text("Выберите лигу:",
+                                    reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def league_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    code = update.callback_query.data.split(":")[1]
+
+    async with async_session() as s:
+        t = await s.scalar(select(Tournament).where(Tournament.code == code))
+        if not t:
+            await update.callback_query.edit_message_text("Пока нет матчей 🚫")
+            return
+
+        now  = dt.datetime.now(dt.timezone.utc)
+        rows = await s.scalars(
+            select(Match)
+            .where((Match.tournament_id == t.id) & (Match.utc_kickoff > now))
+            .order_by(Match.utc_kickoff)
+        )
+        matches = rows.all()
+
     if not matches:
-        await upd.effective_chat.send_message("Пока нет матчей 🚫")
+        await update.callback_query.edit_message_text("Пока нет матчей 🚫")
         return
-    lines = [
-        f"MD {m.matchday}: {m.utc_kickoff:%d %b %H:%M}  "
-        f"{m.home_team.name} — {m.away_team.name}"
-        for m in matches
-    ]
-    await upd.effective_chat.send_message("\n".join(lines))
+
+    kb = []
+    for m in matches:
+        txt = f"{m.home_team.name} — {m.away_team.name} " \
+              f"({m.utc_kickoff:%d %b %H:%M})"
+        kb.append([InlineKeyboardButton(txt, callback_data=f"match:{m.id}")])
+
+    await update.callback_query.edit_message_text(
+        "Ближайшие матчи:",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+
+async def match_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text(
+        "⚙️ Составы пока не готовы. Будет позже 🙂"
+    )
+
+
+def register(app: Application):
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(league_cb, pattern="^league:"))
+    app.add_handler(CallbackQueryHandler(match_cb,  pattern="^match:"))
