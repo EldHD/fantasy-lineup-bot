@@ -1,21 +1,24 @@
 # bot/main.py
-import asyncio
 from telegram.ext import Application
-from bot.config import TELEGRAM_TOKEN
-from bot.handlers import register_handlers        # ← вместо «start»
 
-async def start_bot() -> None:
+from bot.config   import TELEGRAM_TOKEN
+from bot.handlers import register_handlers
+
+
+def main() -> None:
+    """Единственная точка входа – без asyncio.run()."""
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .build()
     )
 
-    # все /start-, callback- и другие хендлеры
-    # регистрируются одной функцией ↓
+    # клавиатуры, /start и прочие callbacks
     register_handlers(app)
 
-    await app.run_polling()      # запускает initialize / start / idle
+    # ⇣  внутри выполняет initialize → start → idle → shutdown
+    app.run_polling()
+
 
 if __name__ == "__main__":
-    asyncio.run(start_bot())
+    main()
