@@ -1,10 +1,8 @@
-import asyncio
-import logging
-
+import asyncio, logging
 from telegram.ext import ApplicationBuilder
 from bot.config import TELEGRAM_TOKEN
 from bot.handlers import register_handlers
-from bot.db.patch_schema import apply_async as patch_schema_async
+from bot.db.patch_schema import apply_async
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s:%(name)s: %(message)s")
@@ -12,20 +10,21 @@ log = logging.getLogger(__name__)
 
 
 def main() -> None:
-    # единый event-loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    asyncio.run(start_bot())            # единая точка входа
 
-    # патчим БД до старта бота
-    log.info("🔧 Проверка/патч схемы БД …")
-    loop.run_until_complete(patch_schema_async())
 
-    # Telegram-бот
+async def start_bot() -> None:
+    log.info("🔧 Проверка схемы БД …")
+    await apply_async()                 # дождались, что всё ок
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     register_handlers(app)
 
     log.info("🤖 Bot starting polling …")
-    app.run_polling()          # использует тот же loop
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    await app.updater.idle()
 
 
 if __name__ == "__main__":
