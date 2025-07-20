@@ -42,7 +42,7 @@ def render_matches_text(league_code: str, matches: List[MatchDict]) -> str:
     md = matches[0].get("matchday")
     if md == "guessed":
         md_part = "Тур (оценка)"
-    elif md and md != 10_000:
+    elif md:
         md_part = f"Тур {md}"
     else:
         md_part = "Ближайшие матчи"
@@ -97,5 +97,5 @@ def render_no_matches_error(league_code: str, err: dict) -> str:
         base.append(f"DEBUG: {err['debug']}")
 
     base.append("Источник: Transfermarkt (gesamtspielplan)")
-    base.append("Советы: проверь опубликован ли календарь / TM_SEASON_YEAR / позже / другой IP / TM_CALENDAR_DEBUG=1.")
+    base.append("Советы: проверь календарь / TM_SEASON_YEAR / подожди / другой IP / TM_CALENDAR_DEBUG=1.")
     return "\n".join(base)
