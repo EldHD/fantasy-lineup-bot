@@ -1,7 +1,17 @@
+"""
+Глобальная конфигурация бота (универсальная).
+
+Все значения можно переопределить через переменные окружения Railway.
+Если переменная окружения не найдена — используется дефолт.
+
+Старайся НЕ редактировать другие файлы под новые имена констант:
+тут собраны и "правильные", и резервные алиасы (для старого кода).
+"""
+
 import os
 import logging
 import random
-from typing import List, Dict
+from typing import Dict, List, Optional
 
 # ------------------------------------------------------------------------------
 # ЛОГИРОВАНИЕ
@@ -14,11 +24,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------------------
-# TELEGRAM
+# TELEGRAM TOKEN
 # ------------------------------------------------------------------------------
 BOT_TOKEN = (
     os.getenv("BOT_TOKEN")
-    or os.getenv("TELEGRAM_TOKEN")
+    or os.getenv("TELEGRAM_TOKEN")  # альтернативное имя
     or ""
 )
 if not BOT_TOKEN:
@@ -33,11 +43,14 @@ DATABASE_URL = os.getenv(
 )
 
 # ------------------------------------------------------------------------------
-# ЛИГИ / КОДЫ / ОТОБРАЖЕНИЕ
+# ЛИГИ / КОДЫ / DISPLAY
 # ------------------------------------------------------------------------------
+# Внутренние коды лиг
 LEAGUE_CODES: List[str] = ["epl", "laliga", "seriea", "bundesliga", "ligue1", "rpl"]
-LEAGUES = LEAGUE_CODES  # алиас
+LEAGUES = LEAGUE_CODES            # алиас
+ALL_LEAGUES = LEAGUE_CODES        # ещё один алиас для старого кода
 
+# Отображаемые названия
 LEAGUE_DISPLAY: Dict[str, str] = {
     "epl": "Premier League",
     "laliga": "La Liga",
@@ -46,16 +59,48 @@ LEAGUE_DISPLAY: Dict[str, str] = {
     "ligue1": "Ligue 1",
     "rpl": "RPL",
 }
+LEAGUE_NAMES = LEAGUE_DISPLAY     # алиас
 
+# Transfermarkt competition codes (wettbewerb=)
 LEAGUE_TM_CODES: Dict[str, str] = {
     "epl": "GB1",
     "laliga": "ES1",
     "seriea": "IT1",
-    "bundesliga": "L1",      # при необходимости поправь
+    "bundesliga": "L1",      # при необходимости заменить на "DFL1" или актуальный
     "ligue1": "FR1",
     "rpl": "RU1",
 }
+TM_COMP_CODES = dict(LEAGUE_TM_CODES)  # требуемый ранее алиас
 
+# Slug’и на transfermarkt (английский домен .com)
+LEAGUE_SLUGS_COM: Dict[str, str] = {
+    "epl": "premier-league",
+    "laliga": "laliga",
+    "seriea": "serie-a",
+    "bundesliga": "bundesliga",
+    "ligue1": "ligue-1",
+    "rpl": "premier-liga",
+}
+
+# Slug’и на .world (если отличаются; если нет — дублируем)
+LEAGUE_SLUGS_WORLD: Dict[str, str] = {
+    "epl": "premier-league",
+    "laliga": "laliga",
+    "seriea": "serie-a",
+    "bundesliga": "bundesliga",
+    "ligue1": "ligue-1",
+    "rpl": "premer-liga",  # на world может быть русская транслитерация
+}
+
+# Для функций, которые ожидают один словарь:
+TRANSFERMARKT_SLUGS = {
+    code: LEAGUE_SLUGS_WORLD.get(code) or LEAGUE_SLUGS_COM.get(code)
+    for code in LEAGUE_CODES
+}
+
+# ------------------------------------------------------------------------------
+# СПИСОК КОМАНД (Пока полностью EPL; остальные добавишь позднее)
+# ------------------------------------------------------------------------------
 EPL_TEAM_NAMES: List[str] = [
     "arsenal", "aston_villa", "bournemouth", "brentford", "brighton_hove_albion",
     "chelsea", "crystal_palace", "everton", "fulham", "ipswich_town",
@@ -66,27 +111,30 @@ EPL_TEAM_NAMES: List[str] = [
 
 TOURNAMENT_TEAMS = {
     "epl": EPL_TEAM_NAMES,
-    # добавь остальные лиги по аналогии
+    # здесь позже добавишь команды других лиг
 }
 
 # ------------------------------------------------------------------------------
-# Transfermarkt – домены и пути
+# Transfermarkt базовые адреса
 # ------------------------------------------------------------------------------
 TM_BASE_WORLD = os.getenv("TM_BASE_WORLD", "https://www.transfermarkt.world")
 TM_BASE_COM = os.getenv("TM_BASE_COM", "https://www.transfermarkt.com")
-TM_BASE = TM_BASE_WORLD  # алиас
+TM_BASE = TM_BASE_WORLD  # главное “базовое” (можно переключить позже)
+TM_FALLBACK_BASES = [TM_BASE_WORLD, TM_BASE_COM]
 
+# Основной шаблон пути календаря
 TM_GESAMTSPIELPLAN_PATH = "/{slug}/gesamtspielplan/wettbewerb/{code}"
-
+# query параметры
 TM_QUERY_SEASON_PARAM = "saison_id"
 TM_QUERY_MD_FROM = "spieltagVon"
 TM_QUERY_MD_TO = "spieltagBis"
 
 # ------------------------------------------------------------------------------
-# ПАРСЕР КАЛЕНДАРЯ / СЕЗОН
+# ПАРАМЕТРЫ СЕЗОНА / КАЛЕНДАРЯ
 # ------------------------------------------------------------------------------
 TM_SEASON_YEAR = int(os.getenv("TM_SEASON_YEAR", "2025"))
 
+# Сколько туров максимально “сканить” при поиске текущего (резерв)
 TM_MAX_MATCHDAY_SCAN = int(os.getenv("TM_MAX_MATCHDAY_SCAN", "12"))
 MAX_MATCHDAY_SCAN = TM_MAX_MATCHDAY_SCAN  # алиас
 
@@ -95,26 +143,25 @@ TM_CALENDAR_DEBUG = os.getenv("TM_CALENDAR_DEBUG", "0") == "1"
 TM_MIN_UPCOMING_STOP = int(os.getenv("TM_MIN_UPCOMING_STOP", "5"))
 
 # ------------------------------------------------------------------------------
-# HTTP / ТАЙМАУТЫ / ЗАДЕРЖКИ / USER-AGENTS
+# HTTP / СЕТЕВЫЕ НАСТРОЙКИ
 # ------------------------------------------------------------------------------
 TM_TIMEOUT = float(os.getenv("TM_TIMEOUT", "20.0"))
-HTTP_TIMEOUT = TM_TIMEOUT  # алиас
+HTTP_TIMEOUT = TM_TIMEOUT
+REQUEST_TIMEOUT = TM_TIMEOUT  # ещё один алиас
 
 TM_DELAY_BASE = float(os.getenv("TM_DELAY_BASE", "2.0"))
 TM_DELAY_JITTER = float(os.getenv("TM_DELAY_JITTER", "1.3"))
 
-# Основной (по умолчанию) User-Agent
 TM_USER_AGENT = os.getenv(
     "TM_USER_AGENT",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 )
 
-# Новый список разных User-Agent для ротации (если код его импортирует)
 TM_USER_AGENTS: List[str] = [
     TM_USER_AGENT,
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
@@ -123,74 +170,106 @@ TM_USER_AGENTS: List[str] = [
 ]
 
 def pick_user_agent() -> str:
-    """Возвращает случайный User-Agent из списка."""
     return random.choice(TM_USER_AGENTS)
 
 TM_HEADERS = {
     "User-Agent": pick_user_agent(),
-    "Accept-Language": os.getenv("TM_ACCEPT_LANGUAGE", "en-US,en;q=0.9,de;q=0.8"),
+    "Accept-Language": os.getenv("TM_ACCEPT_LANGUAGE", "en-US,en;q=0.9,de;q=0.8,ru;q=0.7"),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Connection": "keep-alive",
 }
 
 # ------------------------------------------------------------------------------
-# СИНХРОНИЗАЦИЯ / ПРЕДИКТЫ (Job Queue)
+# JOB QUEUE / ПЛАНИРОВАНИЕ
 # ------------------------------------------------------------------------------
 SYNC_INTERVAL_SEC = int(os.getenv("SYNC_INTERVAL_SEC", str(6 * 3600)))              # 6h
 PREDICT_INTERVAL_SEC = int(os.getenv("PREDICT_INTERVAL_SEC", str(6 * 3600 + 600)))  # 6h10m
 
-SYNC_INTERVAL_MIN = int(SYNC_INTERVAL_SEC / 60)          # алиас для старого кода
-PREDICT_INTERVAL_MIN = int(PREDICT_INTERVAL_SEC / 60)
+SYNC_INTERVAL_MIN = SYNC_INTERVAL_SEC // 60
+PREDICT_INTERVAL_MIN = PREDICT_INTERVAL_SEC // 60
 
 FIRST_SYNC_DELAY_SEC = int(os.getenv("FIRST_SYNC_DELAY_SEC", "10"))
 FIRST_PREDICT_DELAY_SEC = int(os.getenv("FIRST_PREDICT_DELAY_SEC", "40"))
 
 # ------------------------------------------------------------------------------
-# ПРЕДИКТЫ / ФОРМАЦИИ
+# ПРЕДИКТЫ / КОМПОНОВКА / ФОРМАЦИИ
 # ------------------------------------------------------------------------------
-DEFAULT_PREDICTION_SOURCE = os.getenv("DEFAULT_PREDICTION_SOURCE", "baseline")
+MIN_STARTERS = 11
 DEFAULT_FORMATION_FALLBACK = os.getenv("DEFAULT_FORMATION_FALLBACK", "4-2-3-1")
+DEFAULT_PREDICTION_SOURCE = os.getenv("DEFAULT_PREDICTION_SOURCE", "baseline")
+FORMATION_PREFERENCE_ORDER = [
+    "4-2-3-1", "4-3-3", "4-3-2-1", "4-4-2", "3-4-2-1", "3-4-3", "5-3-2"
+]
 
 # ------------------------------------------------------------------------------
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ИСТОЧНИКИ / ССЫЛКИ (плейсхолдер)
+# ------------------------------------------------------------------------------
+SOURCE_PRIORITY = ["transfermarkt", "whoscored", "sofascore", "official", "twitter"]
+
+# ------------------------------------------------------------------------------
+# УТИЛИТЫ
 # ------------------------------------------------------------------------------
 def get_transfermarkt_full_url(
     slug: str,
     code: str,
     season_year: int,
-    md_from: int | None = None,
-    md_to: int | None = None,
-    use_world: bool = True
+    md_from: Optional[int] = None,
+    md_to: Optional[int] = None,
+    base: Optional[str] = None
 ) -> str:
     """
-    Формирует полный URL (world или com) для страницы календаря c опциональной фильтрацией по турам.
+    Возвращает полный URL расписания:
+    - slug: slug лиги
+    - code: код соревнования (GB1 и т.д.)
+    - season_year: год сезона (напр. 2025)
+    - md_from / md_to: фильтрация по туру (можно одинаковые)
     """
-    base = TM_BASE_WORLD if use_world else TM_BASE_COM
+    base_url = base or TM_BASE_WORLD
     path = TM_GESAMTSPIELPLAN_PATH.format(slug=slug, code=code)
     query = f"?{TM_QUERY_SEASON_PARAM}={season_year}"
     if md_from is not None:
         query += f"&{TM_QUERY_MD_FROM}={md_from}"
     if md_to is not None:
         query += f"&{TM_QUERY_MD_TO}={md_to}"
-    return base + path + query
+    return base_url + path + query
+
+def build_league_matchday_url(league_code: str, md: int) -> str:
+    """
+    Упрощённый помощник: берёт slug и code из словарей по league_code.
+    """
+    slug = TRANSFERMARKT_SLUGS.get(league_code, league_code)
+    comp = LEAGUE_TM_CODES.get(league_code, "")
+    return get_transfermarkt_full_url(
+        slug=slug,
+        code=comp,
+        season_year=TM_SEASON_YEAR,
+        md_from=md,
+        md_to=md
+    )
 
 # ------------------------------------------------------------------------------
-# ВАЛИДАЦИЯ ОСНОВНЫХ КОНСТАНТ
+# ВАЛИДАЦИЯ ПРИ ЗАПУСКЕ
 # ------------------------------------------------------------------------------
 _required = [
     "LEAGUE_CODES", "LEAGUE_DISPLAY", "LEAGUE_TM_CODES",
-    "TM_BASE_WORLD", "TM_BASE_COM", "TM_GESAMTSPIELPLAN_PATH",
+    "TM_COMP_CODES", "TM_BASE_WORLD", "TM_BASE_COM", "TM_GESAMTSPIELPLAN_PATH",
     "TM_SEASON_YEAR", "TM_MAX_MATCHDAY_SCAN", "TM_MATCHDAY_PARALLEL",
-    "TM_TIMEOUT", "TM_DELAY_BASE", "TM_DELAY_JITTER", "TM_HEADERS", "TM_USER_AGENTS"
+    "TM_TIMEOUT", "TM_DELAY_BASE", "TM_DELAY_JITTER",
+    "TM_HEADERS", "TM_USER_AGENTS", "TRANSFERMARKT_SLUGS"
 ]
 _missing = [n for n in _required if n not in globals()]
 if _missing:
     logger.error("Config missing required constants: %s", ", ".join(_missing))
 else:
-    logger.debug("Config loaded OK. Leagues: %s", ", ".join(LEAGUE_CODES))
+    logger.debug("Config OK. Leagues: %s", ", ".join(LEAGUE_CODES))
 
 logger.debug(
-    "Intervals: sync=%ss (%sm) predict=%ss (%sm) delays(base=%.2f, jitter=%.2f)",
+    "Intervals: sync=%ss (%sm), predict=%ss (%sm), first delays: sync=%ss predict=%ss",
     SYNC_INTERVAL_SEC, SYNC_INTERVAL_MIN,
     PREDICT_INTERVAL_SEC, PREDICT_INTERVAL_MIN,
-    TM_DELAY_BASE, TM_DELAY_JITTER
+    FIRST_SYNC_DELAY_SEC, FIRST_PREDICT_DELAY_SEC
+)
+logger.debug(
+    "HTTP: timeout=%.1fs delay_base=%.2fs jitter=%.2fs user_agents=%d",
+    TM_TIMEOUT, TM_DELAY_BASE, TM_DELAY_JITTER, len(TM_USER_AGENTS)
 )
