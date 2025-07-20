@@ -48,7 +48,6 @@ def _cache_set(league_code: str, data):
 
 # --------- HTTP ----------
 def _headers(english: bool = True) -> Dict[str, str]:
-    # Если english=True – просим английский
     lang = "en-US,en;q=0.9" if english else "ru-RU,ru;q=0.9,en;q=0.8"
     return {
         "User-Agent": random.choice(TM_USER_AGENTS),
@@ -98,7 +97,6 @@ def _detect_matchday_from_text(txt: str) -> Optional[int]:
                     return int(nums[0])
                 except:
                     return None
-    # чистое число
     if re.fullmatch(r"\d{1,3}", lower.strip()):
         try:
             return int(lower.strip())
@@ -108,7 +106,6 @@ def _detect_matchday_from_text(txt: str) -> Optional[int]:
 
 
 def _extract_teams_from_tr(tr: HTMLParser) -> Optional[Tuple[str, str]]:
-    # 1) ссылки /verein/
     team_links = [a for a in tr.css("a") if "/verein/" in (a.attributes.get("href") or "")]
     names = []
     for a in team_links:
@@ -117,7 +114,6 @@ def _extract_teams_from_tr(tr: HTMLParser) -> Optional[Tuple[str, str]]:
             names.append(txt)
         if len(names) == 2:
             break
-    # fallback
     if len(names) < 2:
         alt_links = []
         for td in tr.css("td"):
@@ -188,7 +184,6 @@ def _parse_full_calendar(root: HTMLParser, season_year: int) -> List[dict]:
         local_date = date_ctx.get(idx)
         for td in node.css("td"):
             ttxt = (td.text() or "").strip()
-            # inline date
             d_inline = DATE_RE.search(ttxt)
             if d_inline:
                 dd, mm, yy = d_inline.groups()
@@ -240,16 +235,12 @@ def _group_by_matchday(matches: List[dict]) -> Dict[int, List[dict]]:
     for m in matches:
         md = m.get("matchday")
         if md is None:
-            md = -1  # нераспознанные
+            md = -1
         groups.setdefault(md, []).append(m)
     return groups
 
 
 def _select_next_round_with_headings(matches: List[dict]) -> Tuple[List[dict], str]:
-    """
-    Если распознаны matchday (кроме -1), берём ближайший (минимальный).
-    Возвращаем (список, 'headings') либо ([], 'headings') если не вышло.
-    """
     groups = _group_by_matchday(matches)
     valid = {md: lst for md, lst in groups.items() if md != -1}
     if not valid:
@@ -261,10 +252,6 @@ def _select_next_round_with_headings(matches: List[dict]) -> Tuple[List[dict], s
 
 
 def _select_earliest_n(matches: List[dict], league_code: str) -> Tuple[List[dict], str]:
-    """
-    Эвристика: берем N ранних матчей (по timestamp, потом по id/home).
-    Всем присваиваем matchday='guessed'.
-    """
     n = LEAGUE_MATCHES_PER_ROUND.get(league_code, 10)
     sorted_all = sorted(
         matches,
@@ -279,11 +266,9 @@ def _select_earliest_n(matches: List[dict], league_code: str) -> Tuple[List[dict
 def _final_select(matches: List[dict], league_code: str) -> Tuple[List[dict], str]:
     if not matches:
         return [], "none"
-    # Пытаемся по заголовкам
     first_try, strat = _select_next_round_with_headings(matches)
     if first_try:
         return first_try, strat
-    # fallback: ранние N
     fallback, strat2 = _select_earliest_n(matches, league_code)
     return fallback, strat2
 
@@ -299,11 +284,11 @@ async def fetch_next_matchday_fixtures(league_code: str, limit: int) -> Tuple[Li
     comp = TM_COMP_CODES[league_code]
     season_year = SEASON_START_YEAR
 
-    # Порядок попыток: приоритет .COM английский slug -> world англ -> world локальный
     local_slug = TM_WORLD_LOCAL_SLUG.get(league_code)
     en_slug_world = TM_WORLD_EN_SLUG.get(league_code)
     en_slug_com = TM_COM_EN_SLUG.get(league_code)
 
+    # base, slug, english
     url_attempts: List[Tuple[str, str, bool]] = []
     if en_slug_com:
         url_attempts.append((TM_BASE_COM, en_slug_com, True))
@@ -315,15 +300,12 @@ async def fetch_next_matchday_fixtures(league_code: str, limit: int) -> Tuple[Li
     attempts_diag: List[dict] = []
     errors: List[str] = []
     first_error: Optional[TMFixturesError] = None
-
-    collected_all: List[dict] = []
     selection_strategy = "none"
 
     for base, slug, english in url_attempts:
         url = f"{base}/{slug}/gesamtspielplan/wettbewerb/{comp}/saison_id/{season_year}"
         try:
             root = await _fetch_html(url, english=english)
-            # Кандидатные строки (tr с ссылкой spielbericht)
             candidate_rows = sum(1 for tr in root.css("tr") if tr.css_first("a[href*='/spielbericht/']"))
             all_matches = _parse_full_calendar(root, season_year)
             parsed_count = len(all_matches)
@@ -335,17 +317,13 @@ async def fetch_next_matchday_fixtures(league_code: str, limit: int) -> Tuple[Li
                 "parsed_matches": parsed_count
             })
 
-            if parsed_count > 0 and not collected_all:
-                # Делаем выбор тура / ранних матчей
+            if parsed_count > 0:
                 selected, strategy = _final_select(all_matches, league_code)
                 if selected:
                     selection_strategy = strategy
-                    # ограничим (но limit обычно >= числу в туре)
                     selected = selected[:limit]
                     _cache_set(league_code, selected)
                     return selected, None
-                else:
-                    collected_all = all_matches  # сохраним на случай показа диагностики
         except TMFixturesError as e:
             attempts_diag.append({
                 "url": url,
