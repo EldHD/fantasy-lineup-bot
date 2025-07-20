@@ -1,34 +1,35 @@
 import asyncio
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timezone
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-# Базовый таймаут
 _DEFAULT_TIMEOUT = 25.0
 
-# Маппинг кодов турниров -> unique tournament id (utid)
+# code -> unique tournament id (utid) + человеко-читабельный slug для ссылки
 SOFASCORE_TOURNAMENTS = {
-    "epl":       17,    # Premier League
-    "laliga":     8,
-    "seriea":    23,
-    "bundesliga":35,
-    "ligue1":    34,
-    "rpl":      203,
+    "epl":        {"utid": 17,  "country": "england",  "slug": "premier-league"},
+    "laliga":     {"utid": 8,   "country": "spain",    "slug": "laliga"},
+    "seriea":     {"utid": 23,  "country": "italy",    "slug": "serie-a"},
+    "bundesliga": {"utid": 35,  "country": "germany",  "slug": "bundesliga"},
+    "ligue1":     {"utid": 34,  "country": "france",   "slug": "ligue-1"},
+    "rpl":        {"utid": 203, "country": "russia",   "slug": "premier-league"},
 }
-
 
 # ---------- ВСПОМОГАТЕЛЬНОЕ HTTP ----------
 
-async def _fetch_json(url: str, *, referer: Optional[str] = None) -> Optional[dict]:
+async def _fetch_json(url: str, *, referer: Optional[str] = None) -> Tuple[Optional[dict], int, Optional[str]]:
+    """
+    Возвращает (json|None, status_code, error_text_snippet)
+    error_text_snippet = обрезок тела при неудачном статусе.
+    """
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0 Safari/537.36"
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
         ),
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.8",
@@ -40,59 +41,51 @@ async def _fetch_json(url: str, *, referer: Optional[str] = None) -> Optional[di
     try:
         async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
             r = await client.get(url, headers=headers)
-            if r.status_code == 200:
+            status = r.status_code
+            if status == 200:
                 try:
-                    return r.json()
+                    return r.json(), status, None
                 except Exception as e:
-                    logger.error("JSON parse error for %s: %s", url, e)
+                    logger.error("JSON parse error %s: %s", url, e)
+                    return None, status, f"json-parse-error: {e}"
             else:
-                snippet = (r.text or "")[:240]
-                logger.warning(
-                    "SofaScore GET %s -> %s; snippet=%r",
-                    url, r.status_code, snippet
-                )
+                snippet = (r.text or "")[:200]
+                logger.warning("SofaScore GET %s -> %s; snippet=%r", url, status, snippet)
+                return None, status, snippet
     except httpx.HTTPError as e:
         logger.error("HTTP error %s fetching %s", e, url)
+        return None, 0, f"http-error: {e}"
     except Exception as e:
-        logger.exception("Unexpected error fetching %s: %s", url, e)
-    return None
+        logger.exception("Unexpected error fetching %s", url)
+        return None, 0, f"unexpected: {e}"
 
+# ---------- СЕЗОН ----------
 
-# ---------- ВЫБОР ТЕКУЩЕГО СЕЗОНА ----------
-
-async def _resolve_current_season(utid: int) -> Optional[int]:
-    """
-    Получить актуальный season_id для unique tournament.
-    Берём тот, у которого isCurrent = True, иначе – последний по startDate.
-    """
+async def _resolve_current_season(utid: int, meta: dict) -> Optional[int]:
     seasons_url = f"https://api.sofascore.com/api/v1/unique-tournament/{utid}/seasons"
-    data = await _fetch_json(seasons_url)
-    if not data or "seasons" not in data:
-        logger.warning("No seasons data for utid=%s", utid)
+    data, status, err = await _fetch_json(seasons_url)
+    meta["requests"].append({"url": seasons_url, "status": status, "err": err})
+    if status != 200 or not data or "seasons" not in data:
+        meta["reason"] = f"Не удалось получить список сезонов (status={status})"
         return None
     seasons = data["seasons"]
     if not seasons:
-        logger.warning("Empty seasons list for utid=%s", utid)
+        meta["reason"] = "Пустой список сезонов"
         return None
 
     current = [s for s in seasons if s.get("isCurrent")]
     if current:
-        season_id = current[0].get("id")
-        logger.debug("Resolved current season (isCurrent) utid=%s -> %s", utid, season_id)
-        return season_id
+        sid = current[0].get("id")
+        meta["season_id"] = sid
+        return sid
 
-    # fallback: последний по startTimestamp
-    seasons_sorted = sorted(
-        seasons,
-        key=lambda s: s.get("startTimestamp") or 0,
-        reverse=True
-    )
-    season_id = seasons_sorted[0].get("id")
-    logger.debug("Resolved current season (fallback last) utid=%s -> %s", utid, season_id)
-    return season_id
+    seasons_sorted = sorted(seasons, key=lambda s: s.get("startTimestamp") or 0, reverse=True)
+    sid = seasons_sorted[0].get("id")
+    meta["season_id"] = sid
+    meta["season_fallback"] = True
+    return sid
 
-
-# ---------- ЗАГРУЗКА МАТЧЕЙ ----------
+# ---------- НОРМАЛИЗАЦИЯ СОБЫТИЯ ----------
 
 def _event_to_record(ev: dict) -> Optional[Dict]:
     start_ts = ev.get("startTimestamp")
@@ -109,7 +102,7 @@ def _event_to_record(ev: dict) -> Optional[Dict]:
     matchday = (
         round_info.get("round")
         or ev.get("round")
-        or ev.get("roundInfo", {}).get("name")
+        or round_info.get("name")
     )
     kickoff_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     return {
@@ -121,98 +114,116 @@ def _event_to_record(ev: dict) -> Optional[Dict]:
         "raw_id": ev.get("id"),
     }
 
+# ---------- ОСНОВНАЯ ФУНКЦИЯ ----------
 
-async def fetch_league_matches(league_code: str, limit: int = 10) -> List[Dict]:
+async def fetch_league_matches_with_meta(league_code: str, limit: int = 10) -> Tuple[List[Dict], dict]:
     """
-    Универсальная функция получения ближайших матчей:
-      1) Находим utid
-      2) Подтягиваем актуальный season_id
-      3) Пробуем массив /events
-      4) Если итог < limit — догружаем через /events/next/{page}
+    Возвращает (matches, meta)
+    meta содержит:
+      - league_code
+      - season_id
+      - season_fallback (bool)
+      - requests: список {url,status,err}
+      - raw_events_count
+      - raw_next_added
+      - reason (почему пусто)
+      - link (страница турнира на SofaScore)
     """
-    utid = SOFASCORE_TOURNAMENTS.get(league_code)
-    if not utid:
-        logger.warning("Unknown league_code=%s (no utid)", league_code)
-        return []
+    meta = {
+        "league_code": league_code,
+        "season_id": None,
+        "season_fallback": False,
+        "requests": [],
+        "raw_events_count": 0,
+        "raw_next_added": 0,
+        "reason": None,
+        "link": None,
+    }
+    info = SOFASCORE_TOURNAMENTS.get(league_code)
+    if not info:
+        meta["reason"] = "Неизвестный код лиги"
+        return [], meta
 
-    season_id = await _resolve_current_season(utid)
+    utid = info["utid"]
+    slug = info["slug"]
+    country = info["country"]
+
+    matches: List[Dict] = []
+
+    season_id = await _resolve_current_season(utid, meta)
     if not season_id:
-        logger.warning("Could not resolve season for league_code=%s utid=%s", league_code, utid)
-        return []
+        if meta["reason"] is None:
+            meta["reason"] = "Сезон не найден"
+        return [], meta
 
-    # 1) Основной список событий сезона
+    # Ссылка для пользователя
+    meta["link"] = f"https://www.sofascore.com/tournament/football/{country}/{slug}/{season_id}"
+
+    # Основные события
     events_url = f"https://api.sofascore.com/api/v1/unique-tournament/{utid}/season/{season_id}/events"
-    data = await _fetch_json(events_url)
-    collected: List[Dict] = []
-    if data and "events" in data:
-        raw_events = data["events"]
-        logger.debug("Fetched %d events for %s (season=%s)", len(raw_events), league_code, season_id)
-        for ev in raw_events:
+    data, status, err = await _fetch_json(events_url)
+    meta["requests"].append({"url": events_url, "status": status, "err": err})
+    if status == 200 and data and "events" in data:
+        meta["raw_events_count"] = len(data["events"])
+        for ev in data["events"]:
             rec = _event_to_record(ev)
             if rec:
-                collected.append(rec)
+                matches.append(rec)
+    else:
+        if status != 200:
+            meta["reason"] = f"Основной список событий не получен (status={status})"
 
-    # 2) Если мало — пробуем “next” пагинацию (часто лежат будущие туры)
+    # Догрузка через next
     page = 0
-    # Чтобы не уйти в бесконечную прокрутку: ограничим страниц 6
-    while len(collected) < limit and page < 6:
+    while len(matches) < limit and page < 6:
         next_url = (
             f"https://api.sofascore.com/api/v1/unique-tournament/"
             f"{utid}/season/{season_id}/events/next/{page}"
         )
-        next_data = await _fetch_json(next_url)
+        next_data, nstatus, nerr = await _fetch_json(next_url)
+        meta["requests"].append({"url": next_url, "status": nstatus, "err": nerr})
         page += 1
-        if not next_data or "events" not in next_data:
+        if nstatus != 200 or not next_data or "events" not in next_data:
             break
-        new_added = 0
+        added_here = 0
         for ev in next_data["events"]:
             rec = _event_to_record(ev)
             if rec:
-                # Исключим дубликаты (по start_ts + пара команд)
                 if not any(
-                    r["start_ts"] == rec["start_ts"]
-                    and r["home_team"] == rec["home_team"]
-                    and r["away_team"] == rec["away_team"]
-                    for r in collected
+                    r["start_ts"] == rec["start_ts"] and
+                    r["home_team"] == rec["home_team"] and
+                    r["away_team"] == rec["away_team"]
+                    for r in matches
                 ):
-                    collected.append(rec)
-                    new_added += 1
-        logger.debug(
-            "Page %s added %s new upcoming events (total=%s) for %s",
-            page, new_added, len(collected), league_code
-        )
-        if new_added == 0:
-            # Ничего нового — останавливаемся
+                    matches.append(rec)
+                    added_here += 1
+        meta["raw_next_added"] += added_here
+        if added_here == 0:
             break
 
-    # Сортировка и ограничение
-    collected.sort(key=lambda r: r["start_ts"])
+    matches.sort(key=lambda r: r["start_ts"])
     if limit:
-        collected = collected[:limit]
+        matches = matches[:limit]
+
+    if not matches and meta["reason"] is None:
+        # Определим, это «действительно пусто» или какая-то проблема
+        if meta["raw_events_count"] == 0 and meta["raw_next_added"] == 0:
+            meta["reason"] = "API вернуло 0 будущих матчей (вероятно календарь ещё не опубликован)"
+        else:
+            meta["reason"] = "Не удалось собрать подходящие матчи (фильтрация/статусы)"
 
     logger.info(
-        "fetch_league_matches(%s) -> %d upcoming matches (season=%s)",
-        league_code, len(collected), season_id
+        "fetch_league_matches_with_meta(%s) -> %d matches (season=%s) reason=%s",
+        league_code, len(matches), season_id, meta["reason"]
     )
-    return collected
+    return matches, meta
 
 
-# ---------- Отладочная функция ----------
-
-async def debug_fetch_league_matches(league_code: str):
-    res = await fetch_league_matches(league_code, limit=12)
-    logger.info("DEBUG %s matches:", league_code)
-    for r in res:
-        logger.info(
-            "%s: %s vs %s (%s UTC) md=%s",
-            league_code, r["home_team"], r["away_team"], r["kickoff_utc"], r["matchday"]
-        )
-    return res
-
-
-# Локальный тест
+# Тест локально
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
     async def _t():
-        await debug_fetch_league_matches("epl")
+        m, meta = await fetch_league_matches_with_meta("epl", 12)
+        print("Matches:", len(m))
+        print("Meta:", meta)
     asyncio.run(_t())
