@@ -14,7 +14,6 @@ async def load_matches_for_league(
     *,
     limit: int | None = None
 ) -> Tuple[List[MatchDict], Optional[dict]]:
-    """Возвращает НЕ начавшиеся матчи актуального (текущего) тура."""
     limit = limit or DEFAULT_MATCH_LIMIT
     if USE_TRANSFERMARKT:
         fixtures, err = await fetch_current_matchday_upcoming(league_code, limit)
