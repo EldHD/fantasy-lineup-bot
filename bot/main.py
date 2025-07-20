@@ -1,8 +1,8 @@
 # bot/main.py
 import asyncio
-from telegram.ext import Application, CommandHandler
+from telegram.ext import Application
 from bot.config import TELEGRAM_TOKEN
-from bot.handlers import start             # ваш start-callback
+from bot.handlers import register_handlers        # ← вместо «start»
 
 async def start_bot() -> None:
     app = (
@@ -11,13 +11,11 @@ async def start_bot() -> None:
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start))
+    # все /start-, callback- и другие хендлеры
+    # регистрируются одной функцией ↓
+    register_handlers(app)
 
-    # --------------------- главное изменение --------------------
-    #   Было:  await app.updater.idle()
-    #   Стало: await app.run_polling()
-    # ------------------------------------------------------------
-    await app.run_polling()   # асинхронный удобный one-liner
+    await app.run_polling()      # запускает initialize / start / idle
 
 if __name__ == "__main__":
     asyncio.run(start_bot())
