@@ -64,7 +64,7 @@ USE_TRANSFERMARKT = True
 USE_SOFASCORE = False
 SHOW_ONLY_NEXT_MATCHDAY = True
 
-DEFAULT_MATCH_LIMIT = 60  # запас
+DEFAULT_MATCH_LIMIT = 60
 
 TM_BASE_WORLD = "https://www.transfermarkt.world"
 TM_BASE_COM = "https://www.transfermarkt.com"
@@ -79,11 +79,16 @@ TM_USER_AGENTS = [
 
 TM_CALENDAR_DEBUG = os.getenv("TM_CALENDAR_DEBUG", "0") == "1"
 
+# Планировщик
 SYNC_INTERVAL_SEC = 6 * 3600
 PREDICT_INTERVAL_SEC = SYNC_INTERVAL_SEC + 600
 JOB_INITIAL_DELAY_SYNC = 10
 JOB_INITIAL_DELAY_PREDICT = 40
 
+# --- Новые настройки для конкретной страницы тура ---
+PREFER_MATCHDAY_PAGE = True
+DEFAULT_MATCHDAY = int(os.getenv("DEFAULT_MATCHDAY", "1"))
+MIN_VALID_MONTH = 7  # Игнорировать всё, что раньше июля (для фильтрации старых дат)
 
 def _compute_season_start_year() -> int:
     env_year = os.getenv("TM_SEASON_YEAR")
@@ -91,6 +96,5 @@ def _compute_season_start_year() -> int:
         return int(env_year)
     now = datetime.now(timezone.utc)
     return now.year if now.month >= 7 else now.year - 1
-
 
 SEASON_START_YEAR = _compute_season_start_year()
