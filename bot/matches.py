@@ -1,69 +1,138 @@
 import logging
-import time
-from typing import List, Dict, Tuple, Optional
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional, Tuple
 
 from bot.external.sofascore import (
     get_or_guess_season_id,
-    fetch_upcoming_matches,
+    get_upcoming_matches,
 )
 
 logger = logging.getLogger(__name__)
 
-# Карта наших кодов лиг → SofaScore unique tournament id + ENV для season fallback
-TOURNAMENT_MAP = {
-    "epl": {
-        "unique_tournament_id": 17,
-        "season_env": "EPL_SEASON_ID",
-        "pretty_name": "Premier League",
-    },
-    # При необходимости добавите остальные лиги тут
+# Коды турниров SofaScore (пример: EPL = 17)
+TOURNAMENT_ID_BY_CODE = {
+    "epl": 17,
+    "laliga": 8,
+    "seriea": 23,
+    "bundesliga": 35,
+    "ligue1": 34,
+    "rpl": 203,   # пример, проверь реальный ID, если нужно
 }
 
-def _format_error(debug: Dict[str, any], reason: str) -> str:
-    lines = []
-    tid = debug.get("tournament_id")
-    lines.append(f"Причина: {reason}")
-    lines.append(f"Season ID: {debug.get('season_id')}")
-    lines.append("Шаги:")
-    for st in debug.get("steps", []):
-        lines.append(f" - {st}")
-    return "\n".join(lines)
+# Кэш: { league_code: { "season_id": int, "events": [...], "fetched_at": datetime } }
+_MATCH_CACHE: Dict[str, Dict[str, Any]] = {}
+CACHE_TTL_SECONDS = 15 * 60  # 15 минут
 
+def _cache_valid(entry: Dict[str, Any]) -> bool:
+    ts: datetime = entry.get("fetched_at")
+    if not ts:
+        return False
+    age = (datetime.now(timezone.utc) - ts).total_seconds()
+    return age < CACHE_TTL_SECONDS
 
-async def load_matches_for_league(league_code: str, limit: int = 15) -> Tuple[List[Dict], Optional[str]]:
+async def load_matches_for_league(league_code: str, force_refresh: bool = False) -> Dict[str, Any]:
     """
-    Возвращает (matches, error_message_or_none).
-    matches = список словарей {home, away, startTimestamp, ...}
+    Возвращает структуру:
+    {
+      "ok": bool,
+      "league_code": str,
+      "events": [...],
+      "season_id": ..,
+      "error": str|None,
+      "attempts": [...],
+      "debug": {...},
+    }
     """
-    t0 = time.time()
-    conf = TOURNAMENT_MAP.get(league_code.lower())
-    if not conf:
-        return [], f"Неизвестная лига: {league_code}"
+    league_code = league_code.lower()
+    if league_code not in TOURNAMENT_ID_BY_CODE:
+        return {
+            "ok": False,
+            "league_code": league_code,
+            "events": [],
+            "season_id": None,
+            "error": f"Unknown league code '{league_code}'",
+            "attempts": [],
+            "debug": {},
+        }
 
-    ut_id = conf["unique_tournament_id"]
-    season_env = conf["season_env"]
+    # Кэш
+    if not force_refresh:
+        cache_entry = _MATCH_CACHE.get(league_code)
+        if cache_entry and _cache_valid(cache_entry):
+            return {
+                "ok": True,
+                "league_code": league_code,
+                "events": cache_entry["events"],
+                "season_id": cache_entry["season_id"],
+                "error": None,
+                "attempts": cache_entry.get("attempts", []),
+                "debug": {"cached": True},
+            }
 
-    season_id, debug_season = await get_or_guess_season_id(ut_id, fallback_env_name=season_env)
+    tournament_id = TOURNAMENT_ID_BY_CODE[league_code]
+    season_id, debug_season = await get_or_guess_season_id(tournament_id)
     if not season_id:
-        reason = "Не удалось получить список сезонов (403 / блок или нет ENV fallback)"
-        err_txt = (
-            f"Нет матчей (лига: {league_code})\n"
-            f"{_format_error(debug_season, reason)}\n"
-            f"Подсказка: установите переменную окружения {season_env}=<числовой_id_сезона>"
-        )
-        return [], err_txt
+        return {
+            "ok": False,
+            "league_code": league_code,
+            "events": [],
+            "season_id": None,
+            "error": f"Cannot determine season for tournament {tournament_id}",
+            "attempts": [],
+            "debug": {"season_debug": debug_season},
+        }
 
-    matches, debug_matches, err_matches = await fetch_upcoming_matches(ut_id, season_id, limit=limit)
-    if err_matches or not matches:
-        err_txt = (
-            f"Нет матчей (лига: {league_code})\n"
-            f"Season ID: {season_id}\n"
-            f"Причина: {err_matches}\n"
-            f"Попытки: {debug_matches.get('attempts')}"
-        )
-        return [], err_txt
+    matches_resp = await get_upcoming_matches(season_id=season_id, tournament_id=tournament_id, limit=40)
+    events = matches_resp.get("events", [])
+    attempts = matches_resp.get("attempts", [])
+    errors = matches_resp.get("errors", [])
 
-    dt = time.time() - t0
-    logger.info("Loaded %d matches for %s in %.2fs (season=%s)",
-                len(matches), league_code, dt, season_id)
-    return matches, None
+    if not events:
+        # формируем читабельное описание
+        err_msg = "Нет матчей"
+        if errors:
+            err_msg += f"; errors: {errors[:2]}"
+        return {
+            "ok": False,
+            "league_code": league_code,
+            "events": [],
+            "season_id": season_id,
+            "error": err_msg,
+            "attempts": attempts,
+            "debug": {"season_debug": debug_season},
+        }
+
+    # Сохраняем в кэш
+    _MATCH_CACHE[league_code] = {
+        "season_id": season_id,
+        "events": events,
+        "attempts": attempts,
+        "fetched_at": datetime.now(timezone.utc),
+    }
+
+    return {
+        "ok": True,
+        "league_code": league_code,
+        "events": events,
+        "season_id": season_id,
+        "error": None,
+        "attempts": attempts,
+        "debug": {"season_debug": debug_season},
+    }
+
+def format_events_short(events: List[Dict[str, Any]], limit: int = 8) -> str:
+    """
+    Форматируем список матчей в короткий текст.
+    """
+    lines: List[str] = []
+    for ev in events[:limit]:
+        h = (ev.get("homeTeam") or {}).get("name", "Home")
+        a = (ev.get("awayTeam") or {}).get("name", "Away")
+        ts = ev.get("startTimestamp")
+        if ts:
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            kick = dt.strftime("%Y-%m-%d %H:%M UTC")
+        else:
+            kick = "TBD"
+        lines.append(f"{h} vs {a} — {kick}")
+    return "\n".join(lines)
