@@ -1,25 +1,24 @@
-# main.py
+# bot/main.py
 import logging
+from telegram.ext import ApplicationBuilder
 
-from telegram.ext import Application, CommandHandler
 from bot.config import TELEGRAM_TOKEN
+from bot.handlers import handlers
 from bot.db.patch_schema import apply_sync
-from bot.handlers import start                 # <-- ваш коллбэк /start
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s: %(message)s"
+)
 
+def main():
+    apply_sync()  # применим патчи к базе перед стартом бота
 
-def main() -> None:
-    apply_sync()                               # патч-upgrade БД (синхронно)
+    logging.info("🤖 Bot starting polling …")
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-
-    log.info("🤖 Bot starting polling …")
-    # ← run_polling() уже сам создаёт/закрывает цикл событий
-    app.run_polling()
-
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    handlers(app)  # подключаем хендлеры команд
+    app.run_polling()  # <-- работает синхронно, сам поднимает event loop
 
 if __name__ == "__main__":
     main()
