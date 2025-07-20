@@ -40,12 +40,7 @@ def render_matches_text(league_code: str, matches: List[MatchDict]) -> str:
     if not matches:
         return f"Нет матчей (лига: {disp})"
     md = matches[0].get("matchday")
-    if md == "guessed":
-        md_part = "Тур (оценка)"
-    elif md:
-        md_part = f"Тур {md}"
-    else:
-        md_part = "Ближайшие матчи"
+    md_part = f"Тур {md}" if md else "Ближайшие матчи"
     lines = [f"{md_part} ({disp}):"]
     for m in matches:
         dt_part = ""
@@ -53,8 +48,6 @@ def render_matches_text(league_code: str, matches: List[MatchDict]) -> str:
             dt_part = f"{m['date']} {m['time']}"
         elif m.get("date"):
             dt_part = m["date"]
-        elif m.get("time"):
-            dt_part = m["time"]
         id_part = f" #{m['id']}" if m.get("id") else ""
         lines.append(f"- {m['home']} vs {m['away']} {dt_part}{id_part}")
     return "\n".join(lines)
@@ -67,35 +60,15 @@ def render_no_matches_error(league_code: str, err: dict) -> str:
     if msg:
         base.append(f"Причина: {msg}")
 
+    md = err.get("matchday")
+    if md:
+        base.append(f"Матчдей: {md}")
     season_year = err.get("season_year")
     if season_year:
         base.append(f"Season start year: {season_year}")
-
-    strat = err.get("selection_strategy")
-    if strat:
-        base.append(f"Selection strategy: {strat}")
 
     attempts = err.get("attempts") or []
     if attempts:
         base.append("Попытки:")
         for a in attempts:
-            url = a.get("url")
-            st = a.get("status")
-            if "error" in a:
-                base.append(f" - {url} | status={st} | error={a['error']}")
-            else:
-                base.append(
-                    f" - {url} | status={st} | candidates={a.get('candidate_rows')} | parsed={a.get('parsed_matches')}"
-                )
-    errors = err.get("errors")
-    if errors:
-        base.append("Ошибки (первые):")
-        for e in errors:
-            base.append(f"   * {e}")
-
-    if err.get("debug"):
-        base.append(f"DEBUG: {err['debug']}")
-
-    base.append("Источник: Transfermarkt (gesamtspielplan)")
-    base.append("Советы: проверь календарь / TM_SEASON_YEAR / подожди / другой IP / TM_CALENDAR_DEBUG=1.")
-    return "\n".join(base)
+            url =
