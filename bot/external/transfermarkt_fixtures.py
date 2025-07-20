@@ -9,9 +9,9 @@ from selectolax.parser import HTMLParser
 
 from bot.config import (
     TM_COMP_CODES,
+    TM_WORLD_LOCAL_SLUG,
     TM_WORLD_EN_SLUG,
     TM_COM_EN_SLUG,
-    TM_WORLD_LOCAL_SLUG,
     TM_BASE_WORLD,
     TM_BASE_COM,
     TM_TIMEOUT,
@@ -19,37 +19,31 @@ from bot.config import (
     TM_CACHE_TTL,
     LEAGUE_DISPLAY,
     SEASON_START_YEAR,
-    TM_CALENDAR_DEBUG,
-    LEAGUE_MATCHES_PER_ROUND,
-    PREFER_MATCHDAY_PAGE,
-    DEFAULT_MATCHDAY,
-    MIN_VALID_MONTH,
+    MAX_MATCHDAY_SCAN,
 )
 
-# --------- КЭШ ----------
-_cache: Dict[str, Dict[str, Any]] = {}
+# ------------------ КЭШ ------------------
+_cache: Dict[str, Dict[str, Any]] = {}  # key -> {ts, data}
 
+def _cache_key(league: str, season: int, md: int) -> str:
+    return f"tm_md:{league}:{season}:{md}"
 
-def _cache_key(league_code: str, matchday: int) -> str:
-    return f"tm_md:{league_code}:{matchday}"
-
-
-def _cache_get(league_code: str, matchday: int):
-    entry = _cache.get(_cache_key(league_code, matchday))
+def _cache_get(league: str, season: int, md: int):
+    key = _cache_key(league, season, md)
+    entry = _cache.get(key)
     if not entry:
         return None
     if time.time() - entry["ts"] > TM_CACHE_TTL:
-        _cache.pop(_cache_key(league_code, matchday), None)
+        _cache.pop(key, None)
         return None
     return entry["data"]
 
+def _cache_set(league: str, season: int, md: int, data):
+    key = _cache_key(league, season, md)
+    _cache[key] = {"ts": time.time(), "data": data}
 
-def _cache_set(league_code: str, matchday: int, data):
-    _cache[_cache_key(league_code, matchday)] = {"ts": time.time(), "data": data}
-
-
-# --------- HTTP ----------
-def _headers(english: bool = True) -> Dict[str, str]:
+# ------------------ HTTP ------------------
+def _headers(english: bool) -> Dict[str, str]:
     lang = "en-US,en;q=0.9" if english else "ru-RU,ru;q=0.9,en;q=0.8"
     return {
         "User-Agent": random.choice(TM_USER_AGENTS),
@@ -57,8 +51,8 @@ def _headers(english: bool = True) -> Dict[str, str]:
         "Accept-Language": lang,
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
+        "Referer": TM_BASE_COM + "/" if english else TM_BASE_WORLD + "/",
     }
-
 
 class TMFixturesError(Exception):
     def __init__(self, message: str, *, url: str | None = None, status: int | None = None):
@@ -66,98 +60,86 @@ class TMFixturesError(Exception):
         self.url = url
         self.status = status
 
-
 async def _fetch_html(url: str, english: bool) -> HTMLParser:
     async with httpx.AsyncClient(timeout=TM_TIMEOUT, follow_redirects=True) as client:
         try:
-            resp = await client.get(url, headers=_headers(english=english))
+            resp = await client.get(url, headers=_headers(english))
         except Exception as e:
             raise TMFixturesError(f"Request exception: {e}", url=url)
     if resp.status_code != 200:
         raise TMFixturesError(f"HTTP {resp.status_code}", url=url, status=resp.status_code)
     return HTMLParser(resp.text)
 
+# ------------------ ПАРСИНГ ------------------
+DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})")
+TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
+SCORE_RE = re.compile(r"\b(\d{1,2}):(\d{1,2})\b")
 
-DATE_RE = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})")  # на TM обычно dd.mm.yyyy
-TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
+def _extract_match_id(href: str) -> Optional[str]:
+    # /spielbericht/.../<id>
+    parts = [p for p in href.split("/") if p.isdigit()]
+    if parts:
+        return parts[-1]
+    return None
 
-
-def _norm_year(y: str) -> int:
-    return int("20" + y) if len(y) == 2 else int(y)
-
-
-def _parse_matchday_table(root: HTMLParser) -> List[dict]:
-    """
-    Из таблицы тура вытаскиваем строки с матчами.
-    Ищем ссылки /spielbericht/ID
-    """
-    matches = []
+def _parse_matchday_table(root: HTMLParser, season_year: int) -> List[dict]:
+    matches: List[dict] = []
     for tr in root.css("tr"):
         rep = tr.css_first("a[href*='/spielbericht/']")
         if not rep:
             continue
 
-        # Получаем клубы
-        # На страницах тура обычно есть по два 'td' с классами 'text-right' и 'no-border-links hauptlink'
-        tds = tr.css("td")
-        home = away = None
-        # Пробуем извлечь из ссылок с '/verein/'
-        club_links = [a for a in tr.css("a") if "/verein/" in (a.attributes.get("href") or "")]
-        club_names = []
-        for a in club_links:
-            txt = (a.text() or "").strip()
-            if txt and txt not in club_names:
-                club_names.append(txt)
-            if len(club_names) == 2:
+        # Команды
+        team_links = [a for a in tr.css("a") if "/verein/" in (a.attributes.get("href") or "")]
+        team_names = []
+        for a in team_links:
+            nm = (a.text() or "").strip()
+            if nm and nm not in team_names:
+                team_names.append(nm)
+            if len(team_names) == 2:
                 break
-        if len(club_names) == 2:
-            home, away = club_names
-        else:
-            # fallback — пробежаться по tds
-            texts = [ (td.text() or "").strip() for td in tds ]
-            # Иногда home в первом/втором "hauptlink"
-            # Оставим как есть если не нашли
-            pass
-
-        if not home or not away:
+        if len(team_names) < 2:
             continue
+        home, away = team_names[0], team_names[1]
 
-        # Дата/время
+        tds = tr.css("td")
         date_str = None
         time_str = None
+        score_present = False
+
         for td in tds:
             txt = (td.text() or "").strip()
-            m_date = DATE_RE.search(txt.replace("/", ".").replace("-", "."))
-            if m_date:
-                dd, mm, yy = m_date.groups()
-                d_i, m_i = int(dd), int(mm)
-                y_i = _norm_year(yy)
-                # фильтр по сезону: отбрасываем даты до июля
-                if m_i < MIN_VALID_MONTH:
-                    continue
-                if y_i < SEASON_START_YEAR:
-                    continue
-                date_str = f"{d_i:02d}/{m_i:02d}/{y_i}"
-            m_time = TIME_RE.search(txt)
-            if m_time:
-                hh, mn = m_time.groups()
-                time_str = f"{int(hh):02d}:{int(mn):02d}"
+            cls = td.attributes.get("class", "")
+            if not date_str:
+                dmatch = DATE_RE.search(txt)
+                if dmatch:
+                    d, m, y = dmatch.groups()
+                    date_str = f"{int(d):02d}/{int(m):02d}/{y}"
+            if not time_str:
+                tmatch = TIME_RE.search(txt)
+                if tmatch:
+                    hh, mm = tmatch.groups()
+                    time_str = f"{int(hh):02d}:{int(mm):02d}"
+            # Результат
+            if "ergebnis" in cls.lower() or "result" in cls.lower():
+                if SCORE_RE.search(txt):
+                    score_present = True
 
-        href = rep.attributes.get("href", "")
-        match_id = None
-        parts = [p for p in href.split("/") if p.isdigit()]
-        if parts:
-            match_id = parts[-1]
+        if not date_str:
+            continue
 
-        # timestamp если возможно
-        ts = None
-        if date_str and time_str:
-            d, m, y = date_str.split("/")
-            try:
-                dt = datetime(int(y), int(m), int(d), int(time_str[:2]), int(time_str[3:]), tzinfo=timezone.utc)
-                ts = int(dt.timestamp())
-            except:
-                pass
+        timestamp = None
+        try:
+            day, month, year = map(int, date_str.split("/"))
+            hour = minute = 0
+            if time_str:
+                hour, minute = map(int, time_str.split(":"))
+            dt = datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+            timestamp = int(dt.timestamp())
+        except Exception:
+            pass
+
+        match_id = _extract_match_id(rep.attributes.get("href", "")) or ""
 
         matches.append({
             "id": match_id,
@@ -165,106 +147,80 @@ def _parse_matchday_table(root: HTMLParser) -> List[dict]:
             "away": away,
             "date_str": date_str,
             "time_str": time_str,
-            "timestamp": ts,
-            "matchday": None,  # добавим позже
+            "timestamp": timestamp,
+            "played": score_present,
         })
     return matches
 
-
-async def _fetch_matchday_page(league_code: str, matchday: int) -> Tuple[List[dict], List[dict]]:
-    """
-    Страница: /<slug>/gesamtspielplan/wettbewerb/<code>?saison_id=YYYY&spieltagVon=X&spieltagBis=X
-    Пробуем несколько баз / языков.
-    """
+async def _fetch_matchday_page(league_code: str, season_year: int, md: int) -> Tuple[List[dict], List[dict]]:
     if league_code not in TM_COMP_CODES:
-        raise TMFixturesError(f"No comp mapping for {league_code}")
+        return [], [{"url": None, "status": 0, "error": f"No comp for {league_code}"}]
+
     comp = TM_COMP_CODES[league_code]
-    season = SEASON_START_YEAR
-
-    attempts_cfg = []
-
     en_slug_com = TM_COM_EN_SLUG.get(league_code)
     en_slug_world = TM_WORLD_EN_SLUG.get(league_code)
     local_slug = TM_WORLD_LOCAL_SLUG.get(league_code)
 
-    # Порядок: .com EN, world EN, world local
+    attempts: List[Tuple[str, str, bool]] = []
     if en_slug_com:
-        attempts_cfg.append((TM_BASE_COM, en_slug_com, True))
+        attempts.append((TM_BASE_COM, en_slug_com, True))
     if en_slug_world:
-        attempts_cfg.append((TM_BASE_WORLD, en_slug_world, True))
+        attempts.append((TM_BASE_WORLD, en_slug_world, True))
     if local_slug and local_slug != en_slug_world:
-        attempts_cfg.append((TM_BASE_WORLD, local_slug, False))
+        attempts.append((TM_BASE_WORLD, local_slug, False))
 
-    attempts_diag: List[dict] = []
+    diag: List[dict] = []
     all_matches: List[dict] = []
 
-    for base, slug, english in attempts_cfg:
-        url = f"{base}/{slug}/gesamtspielplan/wettbewerb/{comp}?saison_id={season}&spieltagVon={matchday}&spieltagBis={matchday}"
+    for base, slug, english in attempts:
+        url = f"{base}/{slug}/gesamtspielplan/wettbewerb/{comp}?saison_id={season_year}&spieltagVon={md}&spieltagBis={md}"
         try:
-            root = await _fetch_html(url, english=english)
-            parsed = _parse_matchday_table(root)
-            attempts_diag.append({
-                "url": url, "status": 200, "parsed": len(parsed)
-            })
+            root = await _fetch_html(url, english)
+            parsed = _parse_matchday_table(root, season_year)
+            diag.append({"url": url, "status": 200, "parsed": len(parsed)})
             if parsed:
                 all_matches = parsed
                 break
         except TMFixturesError as e:
-            attempts_diag.append({
-                "url": e.url or url,
-                "status": e.status or 0,
-                "error": str(e)
-            })
+            diag.append({"url": e.url, "status": e.status or 0, "error": str(e)})
         except Exception as e:
-            attempts_diag.append({
-                "url": url,
-                "status": 0,
-                "error": f"Unexpected: {e}"
-            })
+            diag.append({"url": url, "status": 0, "error": f"Unexpected: {e}"})
 
-    return all_matches, attempts_diag
+    return all_matches, diag
 
-
-async def fetch_next_matchday_fixtures(league_code: str, limit: int) -> Tuple[List[dict], Optional[dict]]:
+async def fetch_current_matchday_upcoming(league_code: str, limit: int) -> Tuple[List[dict], Optional[dict]]:
+    """Сканирует с 1-го тура. Берёт первый тур, где есть хотя бы один НЕ начавшийся матч.
+       Возвращает список этих матчей (ограничено limit).
     """
-    Сейчас: берём фиксированный DEFAULT_MATCHDAY (обычно 1).
-    В будущем: можно динамически искать ближайший незавершённый.
-    """
-    matchday = DEFAULT_MATCHDAY
+    season_year = SEASON_START_YEAR
+    overall_attempts: List[dict] = []
 
-    cached = _cache_get(league_code, matchday)
-    if cached is not None:
-        return cached[:limit], None
+    for md in range(1, MAX_MATCHDAY_SCAN + 1):
+        cached = _cache_get(league_code, season_year, md)
+        if cached is not None:
+            matches = cached
+            diag = []
+        else:
+            matches, diag = await _fetch_matchday_page(league_code, season_year, md)
+            _cache_set(league_code, season_year, md, matches)
+        overall_attempts.extend([{"md": md, **d} for d in diag])
 
-    matches, attempts = await _fetch_matchday_page(league_code, matchday)
-
-    if not matches:
-        err = {
-            "message": "No matches parsed",
-            "league_display": LEAGUE_DISPLAY.get(league_code, league_code),
-            "season_year": SEASON_START_YEAR,
-            "attempts": attempts,
-            "matchday": matchday
-        }
-        return [], err
-
-    # Фильтр по лимиту и добавление matchday
-    cleaned = []
-    for m in matches:
-        # Отбрасываем без даты
-        if not m.get("date_str"):
+        if not matches:
+            # пустой тур – пропускаем, идём дальше
             continue
-        m["matchday"] = matchday
-        cleaned.append(m)
-        if len(cleaned) >= LEAGUE_MATCHES_PER_ROUND.get(league_code, 10):
-            break
 
-    if not cleaned:
-        return [], {
-            "message": "All matches dropped after filtering",
-            "attempts": attempts,
-            "matchday": matchday
-        }
+        upcoming = [m for m in matches if not m["played"]]
+        if upcoming:
+            for m in upcoming:
+                m["matchday"] = md
+            return upcoming[:limit], None
+        # если все сыграны – проверяем следующий
 
-    _cache_set(league_code, matchday, cleaned)
-    return cleaned[:limit], None
+    # ничего не нашли
+    return [], {
+        "message": "No upcoming matches in scanned matchdays",
+        "league_display": LEAGUE_DISPLAY.get(league_code, league_code),
+        "season_year": season_year,
+        "attempts": overall_attempts[:10],
+        "scan_limit": MAX_MATCHDAY_SCAN,
+    }
