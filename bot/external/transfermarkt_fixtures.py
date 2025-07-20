@@ -1,41 +1,31 @@
-import asyncio
-import random
 import time
+import random
+import re
 from datetime import datetime
-from typing import List, Tuple, Optional, Dict, Any
+from typing import Dict, Any, List, Optional, Tuple
 
 import httpx
 from selectolax.parser import HTMLParser
 
 from bot.config import (
-    TM_BASE,
-    TM_COMP_CODES,
+    TM_BASE_WORLD,
     TM_TIMEOUT,
     TM_USER_AGENTS,
-    TM_MAX_MATCHDAYS_LOOKAHEAD,
-    TM_REQUEST_DELAY_BASE,
-    TM_RANDOM_JITTER,
     TM_CACHE_TTL,
+    TM_COMP_CODES,
+    TM_WORLD_SLUG,
     LEAGUE_DISPLAY,
     SEASON_START_YEAR,
+    SHOW_ONLY_NEXT_MATCHDAY,
 )
 
-# In-memory cache: key -> {ts, data}
+# ----------------- Кэш -----------------
 _cache: Dict[str, Dict[str, Any]] = {}
 
-
-class TMFixturesError(Exception):
-    def __init__(self, message: str, *, url: str | None = None, status: int | None = None):
-        super().__init__(message)
-        self.url = url
-        self.status = status
-
-
 def _cache_key(league_code: str) -> str:
-    return f"tm_fixtures:{league_code}"
+    return f"tm_world_next:{league_code}"
 
-
-def _get_cache(league_code: str):
+def _cache_get(league_code: str):
     entry = _cache.get(_cache_key(league_code))
     if not entry:
         return None
@@ -44,11 +34,10 @@ def _get_cache(league_code: str):
         return None
     return entry["data"]
 
-
-def _set_cache(league_code: str, data):
+def _cache_set(league_code: str, data):
     _cache[_cache_key(league_code)] = {"ts": time.time(), "data": data}
 
-
+# ----------------- HTTP -----------------
 def _headers() -> Dict[str, str]:
     return {
         "User-Agent": random.choice(TM_USER_AGENTS),
@@ -56,170 +45,253 @@ def _headers() -> Dict[str, str]:
         "Accept-Language": "en-US,en;q=0.9",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
-        "Referer": TM_BASE + "/",
+        "Referer": TM_BASE_WORLD + "/",
     }
 
+class TMFixturesError(Exception):
+    def __init__(self, message: str, *, url: str | None = None, status: int | None = None):
+        super().__init__(message)
+        self.url = url
+        self.status = status
 
-async def _fetch_html(client: httpx.AsyncClient, url: str) -> HTMLParser:
-    try:
-        resp = await client.get(url, headers=_headers())
-    except Exception as e:
-        raise TMFixturesError(f"Request exception: {e}", url=url) from e
+async def _fetch_html(url: str) -> HTMLParser:
+    async with httpx.AsyncClient(timeout=TM_TIMEOUT, follow_redirects=True) as client:
+        try:
+            resp = await client.get(url, headers=_headers())
+        except Exception as e:
+            raise TMFixturesError(f"Request exception: {e}", url=url)
     if resp.status_code != 200:
         raise TMFixturesError(f"HTTP {resp.status_code}", url=url, status=resp.status_code)
-    try:
-        return HTMLParser(resp.text)
-    except Exception as e:
-        raise TMFixturesError(f"HTML parse error: {e}", url=url) from e
+    return HTMLParser(resp.text)
 
+# ----------------- Парсинг -----------------
+DATE_RE = re.compile(r"(\d{1,2})[./](\d{1,2})[./](\d{2,4})")
+TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
+MATCHDAY_MARKERS = ["matchday", "spieltag", "тур", "round"]  # разные языки
 
-def _parse_match_table(root: HTMLParser, season_year: int) -> List[dict]:
+def _norm_year(y: str) -> int:
+    return int("20" + y) if len(y) == 2 else int(y)
+
+def _detect_matchday_from_text(txt: str) -> Optional[int]:
+    lower = txt.lower()
+    # ищем явные слова + число
+    for marker in MATCHDAY_MARKERS:
+        if marker in lower:
+            # извлекаем первое число
+            nums = re.findall(r"\d{1,3}", lower)
+            if nums:
+                try:
+                    return int(nums[0])
+                except:
+                    pass
+    # fallback: если строка просто число (1,2,3…)
+    if re.fullmatch(r"\d{1,3}", lower.strip()):
+        try:
+            return int(lower.strip())
+        except:
+            return None
+    return None
+
+def _parse_full_calendar(root: HTMLParser, season_year: int) -> List[dict]:
     """
-    Парсит одну страницу matchday.
-    Структура на TM может меняться; опираемся на присущие классы:
-    - Таблицы с классами 'livescore' или div c class 'box'
-    - Строки матчей имеют data-matchid (или id можно вытащить из ссылок)
-    Команды: td.verein-heim / td.verein-gast -> a/text
-    Время: td.zeit -> текст (например '15:00')
-    Дата не всегда в строке – обычно заголовок h2 / div с классом 'table-header' перед группой.
-    Упростим: соберём текущую дату блока, обновляем при встрече заголовка.
+    Парсит полную страницу 'gesamtspielplan'.
+    Структура (может меняться): несколько таблиц или одна таблица 'items'.
+    Каждая группа матчей (тур) отделена заголовком <h2>, <h3>, <div class=...> содержащим 'Matchday'/'Spieltag'/...
     """
     matches: List[dict] = []
-    current_date_str = None
+    current_matchday: Optional[int] = None
+    current_date_context = None  # иногда рядом общая дата строки
 
-    # Соберём блоки с датами: заголовки, содержащие день и месяц.
-    # На TM это часто <div class="table-header">Matchday 1  –  17/08/24</div> или похож.
-    # Будем ловить DD/MM.
-    # fallback: если дату не нашли – вставим None.
-    for node in root.css("div.table-header, h2, h3"):
-        txt = (node.text() or "").strip()
-        # ищем паттерн вида 17/08/24 или 17/08/2024
-        if "/" in txt:
-            parts = txt.split()
-            for p in parts:
-                if p.count("/") == 2:
-                    current_date_str = p
+    # Собираем ВСЕ узлы в порядке появления
+    body_nodes = root.css("h1,h2,h3,div,table,tr")
 
-    # Реальные строки матчей
-    for row in root.css("tr"):
-        # Попробуем найти команды
-        home_td = row.css_first("td.verein-heim")
-        away_td = row.css_first("td.verein-gast")
-        if not home_td or not away_td:
-            continue
+    for node in body_nodes:
+        tag = node.tag.lower()
 
-        home = (home_td.text() or "").strip()
-        away = (away_td.text() or "").strip()
-        if not home or not away:
-            continue
+        # Определение туров
+        if tag in ("h2", "h3", "div"):
+            text = (node.text() or "").strip()
+            md = _detect_matchday_from_text(text)
+            if md:
+                current_matchday = md
+                # сбрасываем дату группы
+                current_date_context = None
 
-        # Время
-        time_td = row.css_first("td.zeit")
-        time_txt = (time_td.text() or "").strip() if time_td else ""
+        # Матчи внутри таблиц
+        if tag == "tr":
+            cls = node.attributes.get("class", "")
+            # Пропускаем заголовки и рекламные/пустые
+            if "begegnungZeile" not in cls:
+                # Но некоторые строки даты тура могут быть внутри таблицы
+                maybe_date_txt = (node.text() or "").strip()
+                # Если строка содержит дату формата dd/mm/yy — обновим контекст
+                dmatch = DATE_RE.search(maybe_date_txt)
+                if dmatch:
+                    dd, mm, yy = dmatch.groups()
+                    try:
+                        current_date_context = (int(dd), int(mm), _norm_year(yy))
+                    except:
+                        pass
+                continue
 
-        # ID матча (если есть)
-        match_id = None
-        # Иногда data-matchid:
-        if row.attributes.get("data-matchid"):
-            match_id = row.attributes.get("data-matchid")
-        else:
-            # Попробуем из ссылки
-            link = row.css_first("a[href*='/spielbericht/']")
-            if link:
-                # пример: /spielbericht/index/spielbericht/1234567
-                href = link.attributes.get("href", "")
-                # вытаскиваем числа
-                for token in href.split("/"):
-                    if token.isdigit():
-                        match_id = token
-                        break
+            # Команды: ссылки с class=vereinprofil_tooltip
+            team_links = node.css("a.vereinprofil_tooltip")
+            if len(team_links) < 2:
+                continue
+            home = (team_links[0].text() or "").strip()
+            away = (team_links[-1].text() or "").strip()
+            if not home or not away:
+                continue
 
-        # Парсим дату+время в timestamp (UTC мы не знаем – возьмём naive)
-        # current_date_str может быть формата DD/MM/YY или DD/MM/YYYY
-        ts = None
-        if current_date_str and time_txt:
-            try:
-                dd, mm, yy = current_date_str.split("/")
-                if len(yy) == 2:
-                    # преобразуем к 20yy
-                    yy_full = int("20" + yy)
-                else:
-                    yy_full = int(yy)
-                # иногда сезон: если год не совпадает, но сезон_year = старт, можно доверять yy_full
-                dt = datetime(yy_full, int(mm), int(dd), int(time_txt[0:2]), int(time_txt[3:5]))
-                ts = int(dt.timestamp())
-            except Exception:
-                pass
+            # Время / дополнительная дата
+            time_text = None
+            date_override = None
+            for td in node.css("td"):
+                ttxt = (td.text() or "").strip()
+                if TIME_RE.search(ttxt):
+                    time_text = ttxt
+                # иногда и дата и время в одной ячейке
+                if DATE_RE.search(ttxt):
+                    dm = DATE_RE.search(ttxt)
+                    if dm:
+                        dd, mm, yy = dm.groups()
+                        try:
+                            date_override = (int(dd), int(mm), _norm_year(yy))
+                        except:
+                            pass
 
-        matches.append({
-            "id": match_id,
-            "home": home,
-            "away": away,
-            "time_str": time_txt,
-            "date_str": current_date_str,
-            "timestamp": ts,
-        })
+            if date_override:
+                current_date_context = date_override
+
+            hour = minute = None
+            if time_text:
+                tm = TIME_RE.search(time_text)
+                if tm:
+                    hour, minute = int(tm.group(1)), int(tm.group(2))
+
+            timestamp = None
+            date_str = None
+            if current_date_context:
+                dd, mm, yy = current_date_context
+                date_str = f"{dd:02d}/{mm:02d}/{yy}"
+                if hour is not None and minute is not None:
+                    try:
+                        dt = datetime(yy, mm, dd, hour, minute)
+                        timestamp = int(dt.timestamp())
+                    except:
+                        pass
+
+            # ID
+            match_id = None
+            rep_link = node.css_first("a[href*='/spielbericht/']")
+            if rep_link:
+                href = rep_link.attributes.get("href", "")
+                parts = [p for p in href.split("/") if p.isdigit()]
+                if parts:
+                    match_id = parts[-1]
+
+            matches.append({
+                "matchday": current_matchday,
+                "id": match_id,
+                "home": home,
+                "away": away,
+                "date_str": date_str,
+                "time_str": f"{hour:02d}:{minute:02d}" if hour is not None and minute is not None else None,
+                "timestamp": timestamp,
+            })
 
     return matches
 
-
-async def fetch_transfermarkt_fixtures(league_code: str, limit: int) -> Tuple[List[dict], Optional[dict]]:
+def _select_next_matchday(all_matches: List[dict]) -> List[dict]:
     """
-    Возвращает (список матчей, err_dict)
-    err_dict = { message, attempts: [...], league_display, season_year }
+    Возвращает матчи ближайшего тура.
     """
-    if league_code not in TM_COMP_CODES:
-        return [], {"message": f"No TM competition code for league '{league_code}'"}
+    if not all_matches:
+        return []
 
-    cached = _get_cache(league_code)
+    # Группировка по matchday (None -> в конец)
+    groups: Dict[int, List[dict]] = {}
+    for m in all_matches:
+        md = m.get("matchday")
+        if md is None:
+            # пометим заведомо большим числом, чтобы не ломать сорт
+            md = 10_000
+        groups.setdefault(md, []).append(m)
+
+    # Определяем ближайший по минимальному будущему timestamp
+    now_ts = time.time()
+    GRACE = 6 * 3600  # небольшое окно
+    candidates: List[Tuple[int, float]] = []
+    for md, group in groups.items():
+        future_times = [g["timestamp"] for g in group if g.get("timestamp") and g["timestamp"] >= now_ts - GRACE]
+        if future_times:
+            candidates.append((md, min(future_times)))
+
+    chosen_md = None
+    if candidates:
+        candidates.sort(key=lambda x: (x[1], x[0]))
+        chosen_md = candidates[0][0]
+    else:
+        # все матчи в прошлом/без времени -> берем минимальный matchday
+        chosen_md = min(groups.keys())
+
+    result = groups[chosen_md]
+    # Отсортируем в рамках тура по timestamp (None в конец)
+    result.sort(key=lambda x: (x["timestamp"] is None, x["timestamp"] or 0, x["home"]))
+    return result
+
+async def fetch_next_matchday_fixtures(league_code: str, limit: int) -> Tuple[List[dict], Optional[dict]]:
+    """
+    Возвращает только ближайший тур (или пусто + err).
+    """
+    if league_code not in TM_COMP_CODES or league_code not in TM_WORLD_SLUG:
+        return [], {"message": f"No TM mapping for '{league_code}'"}
+
+    cached = _cache_get(league_code)
     if cached is not None:
-        # Ограничим по limit
-        data = cached[:limit] if limit and len(cached) > limit else cached
-        return data, None
+        # ограничим limit просто для единообразия (обычно тур < limit)
+        return cached[:limit], None
 
-    comp_code = TM_COMP_CODES[league_code]
+    comp = TM_COMP_CODES[league_code]
+    slug = TM_WORLD_SLUG[league_code]
     season_year = SEASON_START_YEAR
-    attempts = []
-    collected: List[dict] = []
-    first_error: TMFixturesError | None = None
 
-    async with httpx.AsyncClient(timeout=TM_TIMEOUT) as client:
-        # Идём по будущим "matchday" (spieltag) начиная с 1 – пока не наберём или не исчерпали лимит lookahead
-        # (Можно улучшить, сначало найти текущий тур – упрощаем.)
-        for matchday in range(1, TM_MAX_MATCHDAYS_LOOKAHEAD + 1):
-            url = f"{TM_BASE}/{LEAGUE_DISPLAY.get(league_code,'')}/spieltag/wettbewerb/{comp_code}/spieltag/{matchday}/saison_id/{season_year}"
-            # В URL в реальности имя лиги в slug (с дефисами), но TM терпим к /<что угодно>/spieltag/wettbewerb/...
-            try:
-                html = await _fetch_html(client, url)
-                partial = _parse_match_table(html, season_year)
-                attempts.append({"matchday": matchday, "url": url, "status": 200, "found": len(partial)})
-                if partial:
-                    # Фильтруем уже прошедшие (по timestamp > сейчас - 6ч) – грубо
-                    now_ts = int(time.time()) - 6 * 3600
-                    future_only = [m for m in partial if (m["timestamp"] or (now_ts + 1)) > now_ts]
-                    if future_only:
-                        collected.extend(future_only)
-                if len(collected) >= limit:
-                    break
-            except TMFixturesError as e:
-                attempts.append({"matchday": matchday, "url": e.url, "status": e.status or 0, "error": str(e)})
-                if first_error is None:
-                    first_error = e
-            # Пауза между турами
-            await asyncio.sleep(TM_REQUEST_DELAY_BASE + random.uniform(0, TM_RANDOM_JITTER))
+    url = f"{TM_BASE_WORLD}/{slug}/gesamtspielplan/wettbewerb/{comp}/saison_id/{season_year}"
 
-    if not collected:
-        err = {
-            "message": first_error and str(first_error) or "No fixtures parsed",
-            "attempts": attempts,
+    try:
+        root = await _fetch_html(url)
+    except TMFixturesError as e:
+        return [], {
+            "message": str(e),
+            "status": e.status,
+            "url": e.url,
             "league_display": LEAGUE_DISPLAY.get(league_code, league_code),
             "season_year": season_year,
         }
-        return [], err
 
-    # Отсортируем по времени, уберём None в конец
-    collected.sort(key=lambda x: (x["timestamp"] is None, x["timestamp"] or 0))
-    sliced = collected[:limit]
+    all_matches = _parse_full_calendar(root, season_year)
 
-    _set_cache(league_code, collected)
-    return sliced, None
+    if not all_matches:
+        return [], {
+            "message": "No matches parsed",
+            "url": url,
+            "league_display": LEAGUE_DISPLAY.get(league_code, league_code),
+            "season_year": season_year,
+        }
+
+    if SHOW_ONLY_NEXT_MATCHDAY:
+        selected = _select_next_matchday(all_matches)
+    else:
+        selected = all_matches
+
+    if not selected:
+        return [], {
+            "message": "No upcoming matchday found",
+            "url": url,
+            "league_display": LEAGUE_DISPLAY.get(league_code, league_code),
+            "season_year": season_year,
+            "parsed_total": len(all_matches),
+        }
+
+    _cache_set(league_code, selected)
+    return selected[:limit], None
