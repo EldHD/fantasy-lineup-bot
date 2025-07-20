@@ -1,7 +1,7 @@
 import time
 import random
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple, Set
 
 import httpx
@@ -19,12 +19,11 @@ from bot.config import (
     TM_CACHE_TTL,
     LEAGUE_DISPLAY,
     SEASON_START_YEAR,
-    SHOW_ONLY_NEXT_MATCHDAY,
     TM_CALENDAR_DEBUG,
     LEAGUE_MATCHES_PER_ROUND,
 )
 
-# --------- КЭШ ----------
+# ---------- КЭШ ----------
 _cache: Dict[str, Dict[str, Any]] = {}
 
 
@@ -46,7 +45,7 @@ def _cache_set(league_code: str, data):
     _cache[_cache_key(league_code)] = {"ts": time.time(), "data": data}
 
 
-# --------- HTTP ----------
+# ---------- HTTP ----------
 def _headers(english: bool = True) -> Dict[str, str]:
     lang = "en-US,en;q=0.9" if english else "ru-RU,ru;q=0.9,en;q=0.8"
     return {
@@ -77,7 +76,7 @@ async def _fetch_html(url: str, english: bool) -> HTMLParser:
     return HTMLParser(resp.text)
 
 
-# --------- ПАРСИНГ ----------
+# ---------- ПАРСИНГ ----------
 DATE_RE = re.compile(r"(\d{1,2})[./](\d{1,2})[./](\d{2,4})")
 TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
 MATCHDAY_MARKERS = ["matchday", "spieltag", "тур", "round"]
@@ -85,6 +84,13 @@ MATCHDAY_MARKERS = ["matchday", "spieltag", "тур", "round"]
 
 def _norm_year(y: str) -> int:
     return int("20" + y) if len(y) == 2 else int(y)
+
+
+def _fix_day_month(d: int, m: int) -> Tuple[int, int]:
+    # Если "месяц" > 12, а "день" <= 12 — скорее всего формат mm/dd
+    if m > 12 and d <= 12:
+        return m, d
+    return d, m
 
 
 def _detect_matchday_from_text(txt: str) -> Optional[int]:
@@ -147,7 +153,9 @@ def _linear_context(root: HTMLParser):
             if dm:
                 dd, mm, yy = dm.groups()
                 try:
-                    current_date = (int(dd), int(mm), _norm_year(yy))
+                    d_int, m_int = int(dd), int(mm)
+                    d_int, m_int = _fix_day_month(d_int, m_int)
+                    current_date = (d_int, m_int, _norm_year(yy))
                 except:
                     pass
         elif tag == "tr":
@@ -156,7 +164,9 @@ def _linear_context(root: HTMLParser):
             if dm and "spielbericht" not in row_text:
                 dd, mm, yy = dm.groups()
                 try:
-                    current_date = (int(dd), int(mm), _norm_year(yy))
+                    d_int, m_int = int(dd), int(mm)
+                    d_int, m_int = _fix_day_month(d_int, m_int)
+                    current_date = (d_int, m_int, _norm_year(yy))
                 except:
                     pass
         matchday_ctx[idx] = current_md
@@ -188,7 +198,9 @@ def _parse_full_calendar(root: HTMLParser, season_year: int) -> List[dict]:
             if d_inline:
                 dd, mm, yy = d_inline.groups()
                 try:
-                    local_date = (int(dd), int(mm), _norm_year(yy))
+                    d_int, m_int = int(dd), int(mm)
+                    d_int, m_int = _fix_day_month(d_int, m_int)
+                    local_date = (d_int, m_int, _norm_year(yy))
                 except:
                     pass
             tm = TIME_RE.search(ttxt)
@@ -198,11 +210,11 @@ def _parse_full_calendar(root: HTMLParser, season_year: int) -> List[dict]:
         date_str = None
         ts = None
         if local_date:
-            dd, mm, yy = local_date
-            date_str = f"{dd:02d}/{mm:02d}/{yy}"
+            d_int, m_int, y_int = local_date
+            date_str = f"{d_int:02d}/{m_int:02d}/{y_int}"
             if hour is not None and minute is not None:
                 try:
-                    dt = datetime(yy, mm, dd, hour, minute)
+                    dt = datetime(y_int, m_int, d_int, hour, minute, tzinfo=timezone.utc)
                     ts = int(dt.timestamp())
                 except:
                     pass
@@ -219,7 +231,7 @@ def _parse_full_calendar(root: HTMLParser, season_year: int) -> List[dict]:
         seen.add(key)
 
         matches.append({
-            "matchday": matchday_ctx.get(idx),
+            "matchday_header": matchday_ctx.get(idx),
             "id": match_id,
             "home": home,
             "away": away,
@@ -230,47 +242,50 @@ def _parse_full_calendar(root: HTMLParser, season_year: int) -> List[dict]:
     return matches
 
 
-def _group_by_matchday(matches: List[dict]) -> Dict[int, List[dict]]:
-    groups: Dict[int, List[dict]] = {}
-    for m in matches:
-        md = m.get("matchday")
-        if md is None:
-            md = -1
-        groups.setdefault(md, []).append(m)
-    return groups
+# ---------- Отбор "Тур 1" ----------
+def _select_first_round(matches: List[dict], league_code: str) -> Tuple[List[dict], str]:
+    """ Выбор первого тура через окно ранних дат с уникальностью команд. """
+    needed = LEAGUE_MATCHES_PER_ROUND.get(league_code, 10)
+    # фильтруем матчи где есть timestamp
+    with_ts = [m for m in matches if m.get("timestamp")]
+    if not with_ts:
+        return [], "no_timestamps"
 
+    with_ts.sort(key=lambda x: (x["timestamp"], x["home"], x["away"]))
+    earliest_ts = with_ts[0]["timestamp"]
+    window_end = earliest_ts + 14 * 24 * 3600  # 14 дней макс расширения
+    selected: List[dict] = []
+    used_teams: Set[str] = set()
 
-def _select_next_round_with_headings(matches: List[dict]) -> Tuple[List[dict], str]:
-    groups = _group_by_matchday(matches)
-    valid = {md: lst for md, lst in groups.items() if md != -1}
-    if not valid:
-        return [], "headings"
-    chosen = min(valid.keys())
-    out = valid[chosen]
-    out.sort(key=lambda x: (x["timestamp"] is None, x["timestamp"] or 0, x["home"]))
-    return out, "headings"
+    for m in with_ts:
+        ts = m["timestamp"]
+        if ts is None or ts > window_end:
+            continue
+        h, a = m["home"], m["away"]
+        # одна команда не может появляться повторно – чтобы получить ровно первый тур
+        if h in used_teams or a in used_teams:
+            continue
+        selected.append(m)
+        used_teams.add(h)
+        used_teams.add(a)
+        if len(selected) >= needed:
+            break
 
+    if len(selected) < needed:
+        # fallback – если уникально не набрали, просто добиваем по времени (редко)
+        for m in with_ts:
+            if m in selected:
+                continue
+            if len(selected) >= needed:
+                break
+            selected.append(m)
 
-def _select_earliest_n(matches: List[dict], league_code: str) -> Tuple[List[dict], str]:
-    n = LEAGUE_MATCHES_PER_ROUND.get(league_code, 10)
-    sorted_all = sorted(
-        matches,
-        key=lambda x: (x["timestamp"] is None, x["timestamp"] or 0, x.get("id") or "", x["home"])
-    )
-    slice_n = sorted_all[:n]
-    for m in slice_n:
-        m["matchday"] = "guessed"
-    return slice_n, "earliest_N"
-
-
-def _final_select(matches: List[dict], league_code: str) -> Tuple[List[dict], str]:
-    if not matches:
-        return [], "none"
-    first_try, strat = _select_next_round_with_headings(matches)
-    if first_try:
-        return first_try, strat
-    fallback, strat2 = _select_earliest_n(matches, league_code)
-    return fallback, strat2
+    if not selected:
+        return [], "empty_after_window"
+    # присвоим matchday = 1
+    for m in selected:
+        m["matchday"] = 1
+    return selected, "window_earliest_unique"
 
 
 async def fetch_next_matchday_fixtures(league_code: str, limit: int) -> Tuple[List[dict], Optional[dict]]:
@@ -288,21 +303,19 @@ async def fetch_next_matchday_fixtures(league_code: str, limit: int) -> Tuple[Li
     en_slug_world = TM_WORLD_EN_SLUG.get(league_code)
     en_slug_com = TM_COM_EN_SLUG.get(league_code)
 
-    # base, slug, english
-    url_attempts: List[Tuple[str, str, bool]] = []
+    attempts: List[Tuple[str, str, bool]] = []
     if en_slug_com:
-        url_attempts.append((TM_BASE_COM, en_slug_com, True))
+        attempts.append((TM_BASE_COM, en_slug_com, True))
     if en_slug_world:
-        url_attempts.append((TM_BASE_WORLD, en_slug_world, True))
+        attempts.append((TM_BASE_WORLD, en_slug_world, True))
     if local_slug and local_slug != en_slug_world:
-        url_attempts.append((TM_BASE_WORLD, local_slug, False))
+        attempts.append((TM_BASE_WORLD, local_slug, False))
 
     attempts_diag: List[dict] = []
     errors: List[str] = []
-    first_error: Optional[TMFixturesError] = None
     selection_strategy = "none"
 
-    for base, slug, english in url_attempts:
+    for base, slug, english in attempts:
         url = f"{base}/{slug}/gesamtspielplan/wettbewerb/{comp}/saison_id/{season_year}"
         try:
             root = await _fetch_html(url, english=english)
@@ -318,7 +331,7 @@ async def fetch_next_matchday_fixtures(league_code: str, limit: int) -> Tuple[Li
             })
 
             if parsed_count > 0:
-                selected, strategy = _final_select(all_matches, league_code)
+                selected, strategy = _select_first_round(all_matches, league_code)
                 if selected:
                     selection_strategy = strategy
                     selected = selected[:limit]
@@ -331,8 +344,6 @@ async def fetch_next_matchday_fixtures(league_code: str, limit: int) -> Tuple[Li
                 "error": str(e)
             })
             errors.append(str(e))
-            if first_error is None:
-                first_error = e
         except Exception as e:
             attempts_diag.append({
                 "url": url,
@@ -340,8 +351,6 @@ async def fetch_next_matchday_fixtures(league_code: str, limit: int) -> Tuple[Li
                 "error": f"Unexpected: {e}"
             })
             errors.append(f"Unexpected: {e}")
-            if first_error is None:
-                first_error = TMFixturesError(str(e), url=url)
 
     debug_excerpt = None
     if TM_CALENDAR_DEBUG and attempts_diag:
@@ -352,7 +361,7 @@ async def fetch_next_matchday_fixtures(league_code: str, limit: int) -> Tuple[Li
         "league_display": LEAGUE_DISPLAY.get(league_code, league_code),
         "season_year": season_year,
         "attempts": attempts_diag,
-        "errors": errors[:5],
+        "errors": errors[:5] if errors else None,
         "selection_strategy": selection_strategy,
         "debug": debug_excerpt,
     }
