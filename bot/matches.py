@@ -1,26 +1,51 @@
-from typing import Tuple, List, Optional
-import bot.config as cfg
+from typing import Tuple, List, Dict
 from bot.external.transfermarkt_fixtures import fetch_current_matchday_upcoming
+from bot.config import MAX_OUTPUT_MATCHES, LEAGUE_DISPLAY
 
-"""
-API для хэндлеров:
-- load_matches_for_league(league_code) -> (fixtures, error)
-Фикстуры — список dict с ключами: match_id, home, away, dt_str, raw_date, raw_time, season
-"""
+Match = Dict[str, object]
 
-async def load_matches_for_league(league_code: str, matchday: int = 1) -> Tuple[List[dict], Optional[str]]:
-    fixtures, err, _debug = await fetch_current_matchday_upcoming(league_code, matchday=matchday)
-    if err:
-        return [], err
-    return fixtures, None
+async def load_matches_for_league(league_code: str, limit: int = None) -> Tuple[List[Match], Dict]:
+    """
+    Асинхронная обёртка (сама внутренняя функция синхронна).
+    Возвращает (matches, meta_or_error).
+    """
+    if limit is None:
+        limit = MAX_OUTPUT_MATCHES
 
-def render_fixtures_text(league_code: str, fixtures: List[dict], matchday: int) -> str:
-    league_name = cfg.LEAGUE_DISPLAY.get(league_code, league_code)
-    if not fixtures:
-        return f"Нет матчей (лига: {league_name})"
-    lines = [f"Тур {matchday} ({league_name}):"]
-    for fx in fixtures:
-        lines.append(
-            f"- {fx['home']} vs {fx['away']} {fx['dt_str'] or ''} #{fx['match_id'] or ''}"
+    # Вызов синхронного парсера – просто напрямую
+    matches, meta = fetch_current_matchday_upcoming(league_code, limit=limit)
+
+    if not matches:
+        meta["error"] = meta.get("error") or _diagnostic_from_meta(meta, league_code)
+    return matches, meta
+
+def _diagnostic_from_meta(meta: Dict, league_code: str) -> str:
+    if meta.get("match_count", 0) == 0:
+        return "No matches parsed"
+    return "Unknown"
+
+def render_matches_text(league_code: str, matches: List[Match], meta: Dict) -> str:
+    league_name = LEAGUE_DISPLAY.get(league_code, league_code)
+    if not matches:
+        attempts_lines = []
+        for a in meta.get("attempts", [])[:6]:
+            if "parsed" in a:
+                attempts_lines.append(f"- {a.get('url')} | md={a.get('md', '?')} | status={a['status']} | parsed={a['parsed']}")
+            else:
+                attempts_lines.append(f"- {a.get('url')} | status={a.get('status')} | error")
+        attempts_block = "\n".join(attempts_lines) if attempts_lines else ""
+        return (
+            f"Нет матчей (лига: {league_name})\n"
+            f"Причина: {meta.get('error','')}\n"
+            f"Season start year: {meta.get('season_start_year')}\n"
+            f"Источник: {meta.get('source')}\n"
+            f"{('Попытки:\n'+attempts_block) if attempts_block else ''}".strip()
         )
+
+    # Иначе форматируем список
+    lines = [f"Матчи (лига: {league_name}):"]
+    for m in matches:
+        mid = m.get("match_id") or "?"
+        dt = m.get("dt_str") or ""
+        lines.append(f"- {m['home']} vs {m['away']} {dt} #{mid}")
     return "\n".join(lines)
