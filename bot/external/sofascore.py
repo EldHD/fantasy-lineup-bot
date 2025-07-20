@@ -1,104 +1,128 @@
-import httpx
 import asyncio
-import random
-import time
+import logging
+from typing import List, Dict, Optional
+from datetime import datetime, timezone
 
-BASE_URL = "https://api.sofascore.com/api/v1"
+import httpx
 
-# Карта Sofascore ID команд, с которых начинаем
-SOFASCORE_TEAM_IDS = {
-    "Arsenal": 42,
-    "Chelsea": 38,
-    "Zenit": 2699,
-    "CSKA Moscow": 211,
-}
+logger = logging.getLogger(__name__)
 
-USER_AGENTS = [
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-]
-
-BASE_HEADERS = {
-    "Accept": "application/json, text/plain, */*",
-    "Connection": "keep-alive",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Origin": "https://www.sofascore.com",
-    "Referer": "https://www.sofascore.com/",
-}
-
-class SofascoreError(Exception):
-    """Кастомная ошибка для единой обработки."""
-    pass
+# ---------- Общий HTTP клиент ----------
+_DEFAULT_TIMEOUT = 20.0
 
 
-async def _fetch_json(url: str, max_retries: int = 3, backoff: float = 1.2):
+async def _fetch_json(url: str, *, referer: Optional[str] = None) -> Optional[dict]:
     """
-    Универсальный GET c ретраями и случайным User-Agent.
-    Без http2 — чтобы не требовалась установка h2.
+    Универсальная обёртка GET -> JSON.
+    Возвращает dict или None при ошибке.
     """
-    # Простой общий таймаут
-    timeout = 15.0
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.8",
+        "Origin": "https://www.sofascore.com",
+        "Referer": referer or "https://www.sofascore.com/",
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+    }
 
-    last_exc = None
-    for attempt in range(1, max_retries + 1):
-        headers = dict(BASE_HEADERS)
-        headers["User-Agent"] = random.choice(USER_AGENTS)
-
-        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-            try:
-                resp = await client.get(url)
-            except httpx.RequestError as e:
-                last_exc = SofascoreError(f"Network error attempt {attempt}: {e}")
+    try:
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            r = await client.get(url, headers=headers)
+            if r.status_code == 200:
+                return r.json()
             else:
-                if resp.status_code == 200:
-                    try:
-                        return resp.json()
-                    except ValueError as ve:
-                        raise SofascoreError("Invalid JSON in Sofascore response") from ve
-
-                # Антибот / лимиты — можно попробовать повторить
-                if resp.status_code in (403, 429, 503):
-                    last_exc = SofascoreError(
-                        f"HTTP {resp.status_code} (anti-bot/limit) attempt {attempt}; snippet={resp.text[:100].replace(chr(10),' ')}"
-                    )
-                else:
-                    # Прочие коды — не ретраим
-                    raise SofascoreError(
-                        f"HTTP {resp.status_code} {resp.text[:120].replace(chr(10),' ')}"
-                    )
-
-        if attempt < max_retries:
-            await asyncio.sleep(backoff * attempt + random.uniform(0, 0.4))
-
-    # Все попытки исчерпаны
-    if last_exc:
-        raise last_exc
-    raise SofascoreError("Unknown fetch error (no response, no exception?)")
+                snippet = r.text[:200]
+                logger.warning("SofaScore GET %s -> %s (%s)", url, r.status_code, snippet)
+    except httpx.HTTPError as e:
+        logger.error("HTTP error %s fetching %s", e, url)
+    except Exception as e:
+        logger.exception("Unexpected error fetching %s: %s", url, e)
+    return None
 
 
-async def fetch_team_players(sofa_team_id: int):
+# ---------- Матчи турниров ----------
+# Маппинг кодов лиг -> (unique tournament id, season id)
+# season_id нужно обновлять в начале нового сезона.
+SOFASCORE_TOURNAMENTS = {
+    "epl":       {"utid": 17,  "season": 52186},  # Premier League 2024/25
+    "laliga":    {"utid": 8,   "season": 52177},  # La Liga
+    "seriea":    {"utid": 23,  "season": 52192},  # Serie A
+    "bundesliga":{"utid": 35,  "season": 52157},  # Bundesliga
+    "ligue1":    {"utid": 34,  "season": 52187},  # Ligue 1
+    "rpl":       {"utid": 203, "season": 52170},  # Russian Premier League
+}
+
+
+async def fetch_league_matches(league_code: str, limit: int = 10) -> List[Dict]:
     """
-    Возвращает список игроков для команды Sofascore.
-    Поднимает SofascoreError при проблеме.
+    Получить ближайшие (не начавшиеся) матчи для лиги из SofaScore.
+    Возвращает список словарей:
+    {
+        'matchday': int | None,
+        'home_team': str,
+        'away_team': str,
+        'kickoff_utc': datetime,
+        'start_ts': int,
+    }
     """
-    url = f"{BASE_URL}/team/{sofa_team_id}/players"
+    info = SOFASCORE_TOURNAMENTS.get(league_code)
+    if not info:
+        logger.warning("Unknown league_code=%s for SofaScore", league_code)
+        return []
+
+    utid = info["utid"]
+    season = info["season"]
+
+    url = f"https://api.sofascore.com/api/v1/unique-tournament/{utid}/season/{season}/events"
     data = await _fetch_json(url)
-    players = data.get("players")
-    if players is None:
-        raise SofascoreError("Field 'players' missing in Sofascore JSON")
-    return players
+    if not data or "events" not in data:
+        return []
+
+    events = data["events"]
+    upcoming = []
+    now_ts = int(datetime.now(tz=timezone.utc).timestamp())
+
+    for ev in events:
+        # Статус матча
+        status = ev.get("status", {}).get("type")
+        start_ts = ev.get("startTimestamp")
+        if status not in ("notstarted", "postponed") or not start_ts:
+            continue
+        if start_ts < now_ts:  # на всякий случай
+            continue
+
+        home = ev.get("homeTeam", {}).get("name") or "?"
+        away = ev.get("awayTeam", {}).get("name") or "?"
+        round_info = ev.get("roundInfo", {})
+        matchday = round_info.get("round") or ev.get("round")
+
+        kickoff_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+        upcoming.append(
+            {
+                "matchday": matchday,
+                "home_team": home,
+                "away_team": away,
+                "kickoff_utc": kickoff_dt,
+                "start_ts": start_ts,
+            }
+        )
+
+    # сортировка и ограничение
+    upcoming.sort(key=lambda x: x["start_ts"])
+    if limit:
+        upcoming = upcoming[:limit]
+    return upcoming
 
 
-# Локальный быстрый тест
+# Простой тест локально:
 if __name__ == "__main__":
     async def _t():
-        try:
-            st = time.time()
-            players = await fetch_team_players(42)
-            print("Count:", len(players), "Time:", round(time.time() - st, 2), "s")
-            if players:
-                print(players[0])
-        except Exception as e:
-            print("TEST ERROR:", e)
+        res = await fetch_league_matches("epl", limit=5)
+        for r in res:
+            print(r)
     asyncio.run(_t())
