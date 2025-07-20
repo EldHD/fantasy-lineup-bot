@@ -32,9 +32,8 @@ TM_COMP_CODES = {
     "rpl": "RU1",
 }
 
-# Локализованный slug (world)
 TM_WORLD_LOCAL_SLUG = {
-    "epl": "premer-liga",     # локализованный (транслит)
+    "epl": "premer-liga",
     "laliga": "laliga",
     "serie_a": "serie-a",
     "bundesliga": "bundesliga",
@@ -42,7 +41,6 @@ TM_WORLD_LOCAL_SLUG = {
     "rpl": "premier-liga",
 }
 
-# Английский slug (world/com)
 TM_WORLD_EN_SLUG = {
     "epl": "premier-league",
     "laliga": "laliga",
@@ -53,29 +51,26 @@ TM_WORLD_EN_SLUG = {
 }
 TM_COM_EN_SLUG = TM_WORLD_EN_SLUG.copy()
 
-# Сколько матчей в туре (для эвристики)
 LEAGUE_MATCHES_PER_ROUND = {
     "epl": 10,
     "laliga": 10,
     "serie_a": 10,
-    "bundesliga": 9,   # 18 команд
-    "ligue1": 9,       # 18 команд (с 23/24)
-    "rpl": 8,          # 16 команд
+    "bundesliga": 9,
+    "ligue1": 9,
+    "rpl": 8,
 }
 
-# --- Режимы --------------------------------------------------
 USE_TRANSFERMARKT = True
 USE_SOFASCORE = False
 SHOW_ONLY_NEXT_MATCHDAY = True
 
-DEFAULT_MATCH_LIMIT = 30  # чуть выше: чтобы мы могли отрезать сами
+DEFAULT_MATCH_LIMIT = 60  # запас
 
-# --- Transfermarkt источники --------------------------------
 TM_BASE_WORLD = "https://www.transfermarkt.world"
 TM_BASE_COM = "https://www.transfermarkt.com"
 
 TM_TIMEOUT = 25.0
-TM_CACHE_TTL = 300  # секунд
+TM_CACHE_TTL = 300
 TM_USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
@@ -84,7 +79,6 @@ TM_USER_AGENTS = [
 
 TM_CALENDAR_DEBUG = os.getenv("TM_CALENDAR_DEBUG", "0") == "1"
 
-# --- Планировщик ---------------------------------------------
 SYNC_INTERVAL_SEC = 6 * 3600
 PREDICT_INTERVAL_SEC = SYNC_INTERVAL_SEC + 600
 JOB_INITIAL_DELAY_SYNC = 10
