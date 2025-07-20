@@ -1,10 +1,11 @@
 import logging
-from typing import List, Dict
+from datetime import timezone
+from typing import List
 
 from telegram import (
     Update,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from telegram.ext import (
     ContextTypes,
@@ -12,121 +13,116 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
-from bot.services.matches import get_upcoming_matches_for_league
+from bot.services.matches import get_upcoming_matches_for_league, clear_matches_cache
 
 logger = logging.getLogger(__name__)
 
-# ---------- ЛИГИ ----------
-LEAGUES = {
-    "epl": "Premier League",
-    "laliga": "La Liga",
-    "seriea": "Serie A",
-    "bundesliga": "Bundesliga",
-    "ligue1": "Ligue 1",
-    "rpl": "Russian Premier League",
-}
-LEAGUE_BUTTONS_ORDER = ["epl", "laliga", "seriea", "bundesliga", "ligue1", "rpl"]
+# --------- КОНСТАНТЫ / КОНФИГ ---------
 
+LEAGUES = [
+    ("Premier League", "epl"),
+    ("La Liga", "laliga"),
+    ("Serie A", "seriea"),
+    ("Bundesliga", "bundesliga"),
+    ("Ligue 1", "ligue1"),
+    ("Russian Premier League", "rpl"),
+]
 
-# ---------- КЛАВИАТУРЫ ----------
+# --------- УТИЛИТЫ КЛАВИАТУР ---------
+
 def leagues_keyboard() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(LEAGUES[c], callback_data=f"league:{c}")]
-        for c in LEAGUE_BUTTONS_ORDER
-    ]
+    rows = [[InlineKeyboardButton(text=name, callback_data=f"league:{code}")]
+            for name, code in LEAGUES]
     return InlineKeyboardMarkup(rows)
 
+def matches_keyboard(league_code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("♻️ Обновить", callback_data=f"refresh_matches:{league_code}")],
+        [InlineKeyboardButton("🏁 Лиги", callback_data="back:leagues")],
+    ])
 
-def matches_nav_keyboard(league_code: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh:{league_code}")],
-            [InlineKeyboardButton("🏁 Лиги", callback_data="back:leagues")],
-        ]
-    )
+def match_team_select_keyboard(league_code: str, match_index: int, home: str, away: str) -> InlineKeyboardMarkup:
+    # (Заготовка — если позже будете выбирать команду)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(home, callback_data=f"team:{league_code}:{match_index}:home")],
+        [InlineKeyboardButton(away, callback_data=f"team:{league_code}:{match_index}:away")],
+        [InlineKeyboardButton("🏟 Матчи", callback_data=f"refresh_matches:{league_code}")],
+        [InlineKeyboardButton("🏁 Лиги", callback_data="back:leagues")],
+    ])
 
+# --------- /start ---------
 
-# ---------- ФОРМАТИРОВАНИЕ ----------
-def format_matches(league_code: str, matches: List[Dict]) -> str:
-    if not matches:
-        return f"Нет матчей (лига: {LEAGUES.get(league_code, league_code)})"
-
-    lines = [f"🗓 Матчи: {LEAGUES.get(league_code, league_code)}"]
-    current_md = None
-    for m in matches:
-        md = m.get("matchday")
-        if md != current_md:
-            lines.append(f"\nТур {md}:")
-            current_md = md
-        ko = m.get("kickoff_utc")
-        if ko:
-            ko_txt = ko.strftime("%Y-%m-%d %H:%M UTC")
-        else:
-            date_raw = m.get("date_raw") or "?"
-            time_raw = m.get("time_raw") or ""
-            ko_txt = f"{date_raw} {time_raw}".strip()
-        lines.append(f"• {m['home_team']} vs {m['away_team']} — {ko_txt}")
-    return "\n".join(lines)[:3900]
-
-
-# ---------- КОМАНДЫ ----------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Выберите лигу:", reply_markup=leagues_keyboard())
 
+# --------- CALLBACK: ВЫБОР ЛИГИ ---------
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "/start – выбрать лигу\n"
-        "После выбора – парсер покажет ближайшие туры (демо)."
-    )
-
-
-# ---------- CALLBACKS ----------
 async def league_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     _, league_code = query.data.split(":", 1)
+    await query.edit_message_text(f"Лига выбрана: {league_code if league_code!='epl' else 'Premier League'}\nЗагружаю матчи...")
+    await send_matches_list(query, league_code)
 
-    await query.edit_message_text(
-        f"Лига выбрана: {LEAGUES.get(league_code, league_code)}\nЗагружаю матчи..."
-    )
-    matches = await get_upcoming_matches_for_league(league_code)
-    text = format_matches(league_code, matches)
-    await query.message.reply_text(text, reply_markup=matches_nav_keyboard(league_code))
+# --------- CALLBACK: ОБНОВЛЕНИЕ МАТЧЕЙ ---------
 
-
-async def refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def refresh_matches_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     _, league_code = query.data.split(":", 1)
+    # Сбрасываем кэш чтобы принудительно перезагрузить
+    clear_matches_cache(league_code)
     await query.edit_message_text("Обновление матчей...")
-    matches = await get_upcoming_matches_for_league(league_code)
-    text = format_matches(league_code, matches)
-    await query.message.reply_text(text, reply_markup=matches_nav_keyboard(league_code))
+    await send_matches_list(query, league_code)
 
+# --------- CALLBACK: НАЗАД К ЛИГАМ ---------
 
-async def back_leagues_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Выберите лигу:", reply_markup=leagues_keyboard())
+async def back_to_leagues_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("Выберите лигу:", reply_markup=leagues_keyboard())
 
+# --------- ВЫВОД СПИСКА МАТЧЕЙ (общая функция) ---------
 
-# ---------- ОБРАБОТЧИК ОШИБОК ----------
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Unhandled error: %s", context.error)
-    try:
-        if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text("⚠️ Внутренняя ошибка. Попробуйте ещё раз позже.")
-    except Exception:
-        pass
+async def send_matches_list(query, league_code: str):
+    matches, meta = await get_upcoming_matches_for_league(league_code, limit=8)
 
+    if matches:
+        lines: List[str] = []
+        lines.append(f"Матчи ({league_code}):")
+        for idx, m in enumerate(matches, start=1):
+            dt = m["kickoff_utc"].strftime("%Y-%m-%d %H:%M UTC")
+            md = m.get("matchday") or "-"
+            lines.append(f"{idx}. {m['home_team']} vs {m['away_team']} — {dt} (тур/раунд: {md})")
+        text = "\n".join(lines)
+        await query.edit_message_text(text, reply_markup=matches_keyboard(league_code))
+    else:
+        # Формируем диагностический блок
+        reason = meta.get("reason") or "Причина не определена"
+        season = meta.get("season_id")
+        req_lines = []
+        for r in meta.get("requests", []):
+            req_lines.append(f"{r['status']} {'OK' if r['status']==200 else ''} {r['url'].split('/api/')[1][:60]}{'' if not r.get('err') else ' ERR'}")
+        req_block = "\n".join(req_lines) if req_lines else "нет запросов"
 
-# ---------- РЕГИСТРАЦИЯ ----------
-def get_handlers():
-    return [
-        CommandHandler("start", start_cmd),
-        CommandHandler("help", help_cmd),
-        CallbackQueryHandler(league_callback, pattern=r"^league:"),
-        CallbackQueryHandler(refresh_callback, pattern=r"^refresh:"),
-        CallbackQueryHandler(back_leagues_callback, pattern=r"^back:leagues$"),
-    ]
+        link = meta.get("link")
+        text = (
+            f"Нет матчей (лига: {league_code})\n"
+            f"Причина: {reason}\n"
+            f"Сезон: {season}\n"
+            f"Запросы:\n{req_block}"
+        )
+        if link:
+            text += f"\nИсточник: {link}"
+        await query.edit_message_text(text, reply_markup=matches_keyboard(league_code))
+
+# --------- РЕГИСТРАЦИЯ ХЕНДЛЕРОВ ---------
+
+def register_handlers(app):
+    app.add_handler(CommandHandler("start", start_cmd))
+
+    app.add_handler(CallbackQueryHandler(league_callback, pattern=r"^league:"))
+    app.add_handler(CallbackQueryHandler(refresh_matches_callback, pattern=r"^refresh_matches:"))
+    app.add_handler(CallbackQueryHandler(back_to_leagues_callback, pattern=r"^back:leagues"))
+
+# (Остальные ваши хендлеры добавьте аналогично)v
