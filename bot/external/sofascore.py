@@ -8,16 +8,16 @@ logger = logging.getLogger(__name__)
 
 SOFASCORE_BASE = "https://api.sofascore.com/api/v1"
 
-# --------- ВСПОМОГАТЕЛЬНЫЕ ИСКЛЮЧЕНИЯ ---------
+# ------------ Исключения ------------
 class SofaScoreError(Exception):
     pass
 
 
-# --------- HTTP КЛИЕНТ С FALLBACK ПО HTTP/2 ---------
+# ------------ HTTP клиент с fallback ------------
 class SofaScoreClient:
     """
-    Клиент SofaScore с возможностью пробовать http2 и откатываться на http1,
-    если библиотека h2 не установлена или соединение не поддерживает.
+    Async клиент SofaScore.
+    Пытается http2 (если включено), при проблеме (нет h2/ошибка) откатывается на http1.
     """
 
     def __init__(
@@ -55,7 +55,6 @@ class SofaScoreClient:
     async def _init_client(self):
         if self._client is not None:
             return
-        # Пытаемся http2 если разрешено
         if self._try_http2:
             try:
                 self._client = httpx.AsyncClient(
@@ -63,12 +62,9 @@ class SofaScoreClient:
                     http2=True,
                     headers=self._headers,
                 )
-                # сделаем легкий запрос, чтобы убедиться что всё хорошо
                 self._http2_in_use = True
             except Exception as e:
-                logger.warning(
-                    "HTTP/2 client init failed (%s). Falling back to HTTP/1.1", e
-                )
+                logger.warning("HTTP/2 init failed (%s). Fallback to HTTP/1.1", e)
                 self._client = httpx.AsyncClient(
                     timeout=self._timeout,
                     headers=self._headers,
@@ -88,7 +84,7 @@ class SofaScoreClient:
         self, endpoint: str, params: Optional[Dict[str, Any]] = None
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
         """
-        Возвращает (json_or_none, error_message_or_none, status_code_or_0)
+        Возвращает (json|None, error|None, status_code|0).
         """
         if self._client is None:
             await self._init_client()
@@ -107,13 +103,12 @@ class SofaScoreClient:
                 return None, f"JSON decode error: {je}", status
             return data, None, status
         except Exception as e:
-            # Если ошибка связана с http2 и мы ещё не откатывались – откат
             msg = str(e)
+            # Fallback при http2 ошибке
             if self._http2_in_use and ("http2" in msg.lower() or "h2" in msg.lower()):
                 logger.warning(
                     "HTTP/2 runtime error (%s). Recreating client as HTTP/1.1", msg
                 )
-                # Пересоздаём клиент без http2
                 try:
                     await self._client.aclose()
                 except Exception:
@@ -123,7 +118,6 @@ class SofaScoreClient:
                     headers=self._headers,
                 )
                 self._http2_in_use = False
-                # Повтор только один раз
                 try:
                     resp = await self._client.get(url, params=params)
                     status = resp.status_code
@@ -136,7 +130,87 @@ class SofaScoreClient:
             return None, f"Request exception: {e}", 0
 
 
-# --------- ФУНКЦИИ ВЫСОКОГО УРОВНЯ ---------
+# ------------ Функции получения сезонов ------------
+
+async def get_seasons_list(
+    tournament_id: int, client: Optional[SofaScoreClient] = None
+) -> Dict[str, Any]:
+    """
+    Возвращает список сезонов турнира (если есть).
+    Endpoint: unique-tournament/{tournament_id}/seasons
+    """
+    own = client is None
+    if client is None:
+        client = SofaScoreClient()
+    data, err, status = await client.get_json(f"unique-tournament/{tournament_id}/seasons")
+    if own:
+        await client.close()
+    return {
+        "data": data if not err else None,
+        "error": err,
+        "status": status,
+    }
+
+
+async def get_current_season_id(
+    tournament_id: int, client: Optional[SofaScoreClient] = None
+) -> Dict[str, Any]:
+    """
+    Endpoint: unique-tournament/{tournament_id}
+    Ожидаем поле uniqueTournament -> currentSeason -> id
+    """
+    own = client is None
+    if client is None:
+        client = SofaScoreClient()
+    data, err, status = await client.get_json(f"unique-tournament/{tournament_id}")
+    season_id = None
+    if not err and isinstance(data, dict):
+        ut = data.get("uniqueTournament") or {}
+        cs = ut.get("currentSeason") or {}
+        season_id = cs.get("id")
+    if own:
+        await client.close()
+    return {
+        "season_id": season_id,
+        "raw": data,
+        "error": err,
+        "status": status,
+    }
+
+
+async def get_or_guess_season_id(
+    tournament_id: int, prefer_current: bool = True
+) -> Tuple[Optional[int], Dict[str, Any]]:
+    """
+    Возвращает (season_id | None, debug_info).
+    1) Пытаемся взять currentSeason.
+    2) Если не получилось – берём первый из списка seasons (обычно упорядочен по убыванию).
+    """
+    debug: Dict[str, Any] = {"steps": []}
+    async with SofaScoreClient() as cl:
+        season_id = None
+
+        if prefer_current:
+            cur = await get_current_season_id(tournament_id, client=cl)
+            debug["steps"].append({"current": cur})
+            if cur.get("season_id"):
+                season_id = cur["season_id"]
+
+        if season_id is None:
+            seasons_resp = await get_seasons_list(tournament_id, client=cl)
+            debug["steps"].append({"seasons": seasons_resp})
+            data = seasons_resp.get("data") or {}
+            seasons = data.get("seasons") if isinstance(data, dict) else None
+            if seasons and isinstance(seasons, list):
+                # Берём первый (обычно самый свежий)
+                season_id = seasons[0].get("id")
+
+        debug["result_season_id"] = season_id
+        return season_id, debug
+
+
+# ------------ Получение ближайших матчей (events) ------------
+
 async def fetch_upcoming_events_for_season(
     season_id: int,
     tournament_id: int,
@@ -145,12 +219,11 @@ async def fetch_upcoming_events_for_season(
     client: Optional[SofaScoreClient] = None,
 ) -> Dict[str, Any]:
     """
-    Получить ближайшие события турнира по сезону.
-    Возвращает структуру:
+    Возвращает:
     {
       "events": [...],
-      "attempts": [ {endpoint, status, error?} ],
-      "errors": [... (строки общих ошибок)],
+      "attempts": [ {endpoint, status, error} ],
+      "errors": [...],
       "season_id": season_id
     }
     """
@@ -162,37 +235,24 @@ async def fetch_upcoming_events_for_season(
     collected: List[Dict[str, Any]] = []
     errors: List[str] = []
 
-    # SofaScore пагинирует: /events/next/0 , /events/next/1 , ...
     page = 0
     while page < batch_pages and len(collected) < limit:
         endpoint = f"unique-tournament/{tournament_id}/season/{season_id}/events/next/{page}"
         data, err, status = await client.get_json(endpoint)
-        attempts.append(
-            {
-                "endpoint": endpoint,
-                "status": status,
-                "error": err,
-            }
-        )
+        attempts.append({"endpoint": endpoint, "status": status, "error": err})
         if err:
             errors.append(f"page {page}: {err}")
-            # При 404 или пустом JSON — считаем что дальше нечего
             if status == 404:
                 break
             page += 1
             continue
-        # Ожидаем поле "events"
         events = data.get("events") if isinstance(data, dict) else None
         if not events:
-            # если пусто — дальше смысла идти может не быть
             page += 1
             continue
         collected.extend(events)
-        if len(events) == 0:
-            break
         page += 1
-        # Небольшая задержка
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.35)
 
     if own_client:
         await client.close()
@@ -210,9 +270,6 @@ async def get_upcoming_matches(
     tournament_id: int,
     limit: int = 30,
 ) -> Dict[str, Any]:
-    """
-    Упрощённая обёртка. Возвращает ту же структуру, что fetch_upcoming_events_for_season.
-    """
     async with SofaScoreClient(try_http2=True) as cl:
         return await fetch_upcoming_events_for_season(
             season_id=season_id,
@@ -220,3 +277,4 @@ async def get_upcoming_matches(
             limit=limit,
             client=cl,
         )
+    
