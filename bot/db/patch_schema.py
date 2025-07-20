@@ -1,15 +1,13 @@
-"""
-Патч схемы БД перед стартом бота.
-Работает на уже открытом event-loop (см. main.py).
-"""
+# bot/db/patch_schema.py
 import logging
-from sqlalchemy import text, inspect
-from .database import engine
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
+from .database import engine           # ваш общий AsyncEngine
 
 log = logging.getLogger(__name__)
 
-# ➊  список «таблица, колонка, DDL» – можете пополнять по мере нужды
-PATCHES: list[tuple[str, str, str]] = [
+PATCHES = [
+    # (таблица, колонка, DDL)
     ("matches", "status",
      "ALTER TABLE matches ADD COLUMN status VARCHAR(20) DEFAULT 'scheduled'"),
     ("matches", "matchday",
@@ -17,22 +15,17 @@ PATCHES: list[tuple[str, str, str]] = [
 ]
 
 
-async def apply_async() -> None:
-    """Добавляет отсутствующие колонки (idempotent)."""
-    async with engine.begin() as async_conn:
-
-        async def _sync(sync_conn):
-            insp = inspect(sync_conn)
-            existing = {
-                table: {c["name"] for c in insp.get_columns(table)}
-                for table in insp.get_table_names()
-            }
-
-            for table, col, ddl in PATCHES:
-                if col in existing.get(table, set()):
-                    log.debug("✓ %s.%s уже есть", table, col)
-                    continue
-                log.info("➕ apply patch: %s", ddl)
-                sync_conn.execute(text(ddl))
-
-        await async_conn.run_sync(_sync)
+async def apply_async(engine_: AsyncEngine = engine) -> None:
+    """Добавляет отсутствующие колонки без транзакции."""
+    async with engine_.connect() as ac:
+        insp = await ac.run_sync(lambda c: {
+            t: {col["name"] for col in c.get_columns(t)}
+            for t in c.get_table_names()
+        })
+        for table, col, ddl in PATCHES:
+            if col in insp.get(table, set()):
+                log.debug("✓ %s.%s уже есть", table, col)
+                continue
+            log.info("➕ %s", ddl)
+            # DDL выполняем AUTOCOMMIT-ом, чтобы сразу было видно
+            await ac.execute(text(ddl).execution_options(autocommit=True))
