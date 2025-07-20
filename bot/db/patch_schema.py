@@ -1,57 +1,54 @@
 """
-Автоматически добавляет недостающие столбцы в существующие таблицы.
-Запускается один раз при старте контейнера. Если столбец уже есть — пропускает.
+Патч-скhema: добавляем отсутствующие столбцы.
+Запускать — до старта бота!
 """
 
-import asyncio
 import logging
-
 from sqlalchemy import text, inspect
 
-from .database import engine  # тот же engine, который ты уже используешь
+from .database import engine  # async engine
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# ------------ что именно патчить -----------------
 PATCHES: list[tuple[str, str, str]] = [
-    # (table, column, DDL)
-    (
-        "matches",
-        "status",
-        "ALTER TABLE matches ADD COLUMN status VARCHAR(20) DEFAULT 'scheduled'"
-    ),
-    (
-        "matches",
-        "matchday",
-        "ALTER TABLE matches ADD COLUMN matchday INT"
-    ),
+    ("matches", "status",
+     "ALTER TABLE matches ADD COLUMN status VARCHAR(20) DEFAULT 'scheduled'"),
+    ("matches", "matchday",
+     "ALTER TABLE matches ADD COLUMN matchday INT"),
 ]
-# --------------------------------------------------
 
 
-async def _apply_patches() -> None:
-    """Проверяем каждую пару (table, column); если столбца нет — выполняем ALTER."""
-    async with engine.begin() as conn:
-        inspector = inspect(conn)
-        tables = inspector.get_table_names()
-        for table, column, ddl in PATCHES:
-            if table not in tables:
-                logger.warning("Таблица %s не найдена — пропуск", table)
-                continue
+async def _apply_async():
+    async with engine.begin() as conn:            # ← async-соединение
 
-            columns = {col["name"] for col in inspector.get_columns(table)}
-            if column in columns:
-                logger.info("Столбец %s.%s уже есть", table, column)
-                continue
+        async def _sync_part(sync_conn):
+            insp = inspect(sync_conn)             # ← уже sync-conn
+            tables = insp.get_table_names()
 
-            logger.info("Добавляем столбец %s.%s", table, column)
-            await conn.execute(text(ddl))
-            logger.info("✅ ALTER выполнен: %s", ddl)
+            for table, column, ddl in PATCHES:
+                if table not in tables:
+                    log.warning("table %s missing – skip", table)
+                    continue
+
+                names = {c["name"] for c in insp.get_columns(table)}
+                if column in names:
+                    log.info("column %s.%s already exists", table, column)
+                    continue
+
+                log.info("ALTER %s", ddl)
+                sync_conn.execute(text(ddl))
+
+        await conn.run_sync(_sync_part)           # ← запускаем sync-блок
 
 
 def run_sync() -> None:
-    """Вспомогательная синхронная обёртка (удобно вызывать из main.py)."""
+    """
+    Блокирующий вызов из main.py.
+    Ошибки — только в лог; бот всё-таки должен стартовать.
+    """
+    import asyncio
+
     try:
-        asyncio.run(_apply_patches())
-    except Exception:
-        logger.exception("‼️ Ошибка при применении патчей (бот всё-таки стартует)")
+        asyncio.run(_apply_async())
+    except Exception:  # noqa
+        log.exception("‼️ Ошибка при patch_schema (игнорирую)")
