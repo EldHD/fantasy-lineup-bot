@@ -1,4 +1,6 @@
 # bot/handlers.py
+
+import datetime as dt
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ContextTypes, Application, CommandHandler, CallbackQueryHandler
@@ -7,9 +9,10 @@ from sqlalchemy import select
 from bot.db.database import async_session
 from bot.db.models   import Tournament, Match
 
-
-LEAGUES = {"Premier League": "epl"}     # + добавите остальные коды
-
+LEAGUES = {
+    "Premier League": "epl",
+    # можно добавить ещё: "La Liga": "laliga", "RPL": "rpl", и т.д.
+}
 
 # ──────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
