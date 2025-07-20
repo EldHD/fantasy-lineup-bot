@@ -1,253 +1,193 @@
 import logging
-from typing import List, Tuple, Optional
+import traceback
+from typing import List, Tuple
 
 from telegram import (
-    Update,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
 )
 from telegram.ext import (
-    ContextTypes,
-    CommandHandler,
+    Application,
     CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
 )
 
-# Парсер матчей (наш новый модуль)
-from bot.matches import load_matches_for_league
+from bot.matches import load_matches_for_league, format_events_short
 
 logger = logging.getLogger(__name__)
 
-# --- Константы / настройки ---
+# Заполни своими chat_id (админы)
+ADMIN_IDS: List[int] = []
 
-LEAGUES = [
-    ("Premier League", "epl"),
-    ("La Liga", "laliga"),
-    ("Serie A", "seriea"),
-    ("Bundesliga", "bundesliga"),
-    ("Ligue 1", "ligue1"),
-    ("Russian Premier League", "rpl"),
+# (код, название)
+LEAGUES: List[Tuple[str, str]] = [
+    ("epl", "Premier League"),
+    ("laliga", "La Liga"),
+    ("seriea", "Serie A"),
+    ("bundesliga", "Bundesliga"),
+    ("ligue1", "Ligue 1"),
+    ("rpl", "Russian Premier League"),
 ]
 
-# CallbackData “простого” формата:
-#   league:<code>
-#   refresh_matches:<code>
-#   back:leagues
-#   match:<league_code>:<match_id>
-#
-# (match_id пока не используется если нет реальных матчей – оставлено для будущего.)
 
-# --- Утилиты формирования клавиатур ---
-
-def leagues_keyboard() -> InlineKeyboardMarkup:
+def make_leagues_keyboard() -> InlineKeyboardMarkup:
     rows = []
-    for title, code in LEAGUES:
+    for code, title in LEAGUES:
         rows.append([InlineKeyboardButton(title, callback_data=f"league:{code}")])
     return InlineKeyboardMarkup(rows)
 
-def matches_keyboard(league_code: str, matches: List[dict]) -> InlineKeyboardMarkup:
-    """
-    Клавиатура списка матчей:
-      - каждая строка: "Home vs Away" (match:<league_code>:<id>)
-      - внизу: Обновить / Лиги
-    """
-    rows: List[List[InlineKeyboardButton]] = []
-    for m in matches:
-        # Фолбэк если нет id
-        mid = m.get("id") or 0
-        home = m.get("home") or "?"
-        away = m.get("away") or "?"
-        caption = f"{home} vs {away}"
-        rows.append([
-            InlineKeyboardButton(
-                caption,
-                callback_data=f"match:{league_code}:{mid}"
-            )
-        ])
-    rows.append([
-        InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_matches:{league_code}")
-    ])
-    rows.append([
-        InlineKeyboardButton("🏁 Лиги", callback_data="back:leagues")
-    ])
-    return InlineKeyboardMarkup(rows)
 
-def error_matches_keyboard(league_code: str) -> InlineKeyboardMarkup:
-    """
-    Клавиатура при ошибке / отсутствии матчей – только Обновить + Лиги
-    """
-    rows = [
-        [InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_matches:{league_code}")],
-        [InlineKeyboardButton("🏁 Лиги", callback_data="back:leagues")],
-    ]
-    return InlineKeyboardMarkup(rows)
+def make_refresh_keyboard(league_code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh:{league_code}")],
+            [InlineKeyboardButton("🏁 Лиги", callback_data="back:leagues")],
+        ]
+    )
 
-def back_leagues_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏁 Лиги", callback_data="back:leagues")]
-    ])
 
-# --- ХЕЛПЕР: загрузка матчей и форматирование ответа ---
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Выберите лигу:", reply_markup=make_leagues_keyboard()
+    )
 
-async def _load_and_render_matches(league_code: str) -> Tuple[str, InlineKeyboardMarkup]:
-    """
-    Загружает матчи для лиги. Возвращает текст и клавиатуру.
-    Если есть матчи – список.
-    Если нет – подробное сообщение об ошибке.
-    """
-    matches, err = await load_matches_for_league(league_code, limit=15)
-    if err:
-        text = err
-        kb = error_matches_keyboard(league_code)
-        return text, kb
 
-    if not matches:
-        text = f"Нет матчей (лига: {league_code}) – пустой список без явной ошибки."
-        kb = error_matches_keyboard(league_code)
-        return text, kb
-
-    # Формируем человекочитаемый список
-    lines = [f"Матчи (лига: {league_code}, найдено: {len(matches)}):"]
-    for i, m in enumerate(matches, 1):
-        home = m.get("home") or "?"
-        away = m.get("away") or "?"
-        ts = m.get("startTimestamp")
-        # TODO: при желании форматировать время (UTC → локально).
-        lines.append(f"{i}. {home} vs {away} (id={m.get('id')}, ts={ts})")
-    lines.append("")
-    lines.append("Выберите матч для (в будущем) показа предикта состава.")
-    text = "\n".join(lines)
-    kb = matches_keyboard(league_code, matches)
-    return text, kb
-
-# --- HANDLERS ---
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Команда /start – показывает список лиг.
-    """
-    await update.message.reply_text("Выберите лигу:", reply_markup=leagues_keyboard())
-
-async def league_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Пользователь выбрал лигу (callback_data=league:<code>)
-    1. Отвечаем "Лига выбрана..."
-    2. Пишем "Загружаю матчи..."
-    3. Грузим матчи
-    4. Редактируем сообщение результатом
-    """
+async def leagues_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not query:
-        return
-
     await query.answer()
-    data = query.data  # league:epl
-    _, league_code = data.split(":", 1)
+    await query.edit_message_text(
+        "Выберите лигу:", reply_markup=make_leagues_keyboard()
+    )
 
-    # Сообщение о выборе
-    await query.edit_message_text(f"Лига выбрана: {league_code.title()}\nЗагружаю матчи...")
-    # Вставим временно “Обновление матчей...” чтобы показать прогресс (не обязательно)
-    # Можно послать новое сообщение, но изменим текущее.
-    await query.message.chat.send_message("Обновление матчей...")
 
-    text, kb = await _load_and_render_matches(league_code)
-    await query.message.chat.send_message(text, reply_markup=kb)
-
-async def refresh_matches_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _load_and_render_matches(league_code: str, force: bool = True) -> Tuple[str, InlineKeyboardMarkup]:
     """
-    Callback "refresh_matches:<code>" – заново подгружает матчи.
+    Унифицированная функция получения текста и клавиатуры для вывода матчей.
     """
+    league_code_norm = (league_code or "").lower()
+    result = await load_matches_for_league(
+        league_code_norm,
+        force_refresh=force,
+        limit=30,  # можно регулировать
+    )
+
+    if not result["ok"]:
+        err = result.get("error") or "Неизвестная ошибка"
+        season_id = result.get("season_id")
+        attempts = result.get("attempts") or []
+        text = (
+            f"Нет матчей (лига: {league_code_norm})\n"
+            f"Season ID: {season_id}\n"
+            f"Причина: {err}\n"
+            f"Попытки: {attempts[:2]}"
+        )
+        return text, make_refresh_keyboard(league_code_norm)
+
+    events = result["events"]
+    text_block = format_events_short(events, limit=30)
+    header = f"Матчи ({league_code_norm.upper()}), сезон {result['season_id']}:\n"
+    return header + (text_block or "Нет данных"), make_refresh_keyboard(league_code_norm)
+
+
+async def league_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not query:
-        return
     await query.answer()
-    _, league_code = query.data.split(":", 1)
 
-    # Обновим это сообщение (query.message) текстом “Обновление матчей...”
     try:
-        await query.edit_message_text(f"Обновление матчей... (лига: {league_code})")
-    except Exception:
-        # Если не можем редактировать (возможно уже обновлено) – проигнорируем
-        pass
+        _, code = query.data.split(":", 1)
+    except ValueError:
+        await query.edit_message_text("Некорректные данные кнопки.")
+        return
 
-    text, kb = await _load_and_render_matches(league_code)
-    # Отправим отдельным сообщением (чтобы гарантированно показать даже если редакт нельзя)
-    await query.message.chat.send_message(text, reply_markup=kb)
+    league_code = code.lower()
+    await query.edit_message_text(
+        f"Лига выбрана: {league_code.upper()}\nЗагружаю матчи..."
+    )
 
-async def back_leagues_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Возврат к списку лиг.
-    """
+    try:
+        text, kb = await _load_and_render_matches(league_code, force=True)
+        await query.edit_message_text(text, reply_markup=kb)
+    except Exception as e:
+        logger.error("Unhandled error", exc_info=True)
+        await query.edit_message_text(
+            "⚠️ Внутренняя ошибка при загрузке матчей.",
+            reply_markup=make_leagues_keyboard(),
+        )
+        tb = traceback.format_exc()
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    f"[ADMIN] Exception league={league_code}\n{tb[:3500]}",
+                )
+            except Exception:
+                pass
+
+
+async def refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query:
-        await query.answer()
+    await query.answer()
+
+    try:
+        _, code = query.data.split(":", 1)
+    except ValueError:
+        await query.edit_message_text("Некорректные данные кнопки.")
+        return
+
+    league_code = code.lower()
+    await query.edit_message_text("Обновление матчей...")
+
+    try:
+        text, kb = await _load_and_render_matches(league_code, force=True)
+        await query.edit_message_text(text, reply_markup=kb)
+    except Exception:
+        logger.error("Unhandled error (refresh)", exc_info=True)
+        await query.edit_message_text(
+            "⚠️ Внутренняя ошибка.",
+            reply_markup=make_refresh_keyboard(league_code),
+        )
+        tb = traceback.format_exc()
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    f"[ADMIN] Exception refresh league={league_code}\n{tb[:3500]}",
+                )
+            except Exception:
+                pass
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Global error handler: %s", context.error, exc_info=True)
+
+    target_chat_id = None
+    if isinstance(update, Update) and update.effective_chat:
+        target_chat_id = update.effective_chat.id
+
+    if target_chat_id:
         try:
-            await query.edit_message_text("Выберите лигу:", reply_markup=leagues_keyboard())
-            return
+            await context.bot.send_message(
+                chat_id=target_chat_id, text="⚠️ Внутренняя ошибка. Попробуйте позже."
+            )
         except Exception:
             pass
-        await query.message.chat.send_message("Выберите лигу:", reply_markup=leagues_keyboard())
-    else:
-        # На всякий случай если кто-то вызовет напрямую
-        await update.message.reply_text("Выберите лигу:", reply_markup=leagues_keyboard())
 
-async def match_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Пользователь нажал на конкретный матч.
-    Пока просто заглушка – здесь интегрируете предикт состава.
-    callback_data = match:<league_code>:<match_id>
-    """
-    query = update.callback_query
-    if not query:
-        return
-    await query.answer()
-    _, league_code, match_id = query.data.split(":", 2)
+    tb = "".join(traceback.format_exception(None, context.error, context.error.__traceback__))
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                f"[ADMIN][GlobalError]\n{tb[:3500]}",
+            )
+        except Exception:
+            pass
 
-    # TODO: здесь вытягиваете подробности матча + предикты.
-    # Например:
-    # predictions = await fetch_predictions_for_match(match_id)  # если реализуете
-    text = (
-        f"Матч выбран (лига={league_code}, id={match_id}).\n"
-        f"Пока предиктов нет.\n"
-        f"Нажмите ▷ Лиги для возврата."
-    )
-    await query.edit_message_text(text, reply_markup=back_leagues_keyboard())
 
-# Глобальный error handler (опционально – чтобы ловить исключения)
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled error", exc_info=context.error)
-    try:
-        if isinstance(update, Update):
-            if update.effective_chat:
-                await update.effective_chat.send_message("⚠️ Внутренняя ошибка. Сообщите администратору.")
-    except Exception:
-        pass
-
-# --- РЕГИСТРАЦИЯ ХЕНДЛЕРОВ ---
-
-def register_handlers(application):
-    """
-    Удобная функция – вызывается из main.py:
-        from bot.handlers import register_handlers
-        register_handlers(app)
-    """
-    application.add_handler(CommandHandler("start", start_cmd))
-
-    # Колбэки
-    application.add_handler(CallbackQueryHandler(league_callback, pattern=r"^league:"))
-    application.add_handler(CallbackQueryHandler(refresh_matches_callback, pattern=r"^refresh_matches:"))
-    application.add_handler(CallbackQueryHandler(back_leagues_callback, pattern=r"^back:leagues$"))
-    application.add_handler(CallbackQueryHandler(match_callback, pattern=r"^match:"))
-
-    # Ошибки
-    application.add_error_handler(error_handler)
-
-# (Если старый код ожидал прямые имена – оставим их экспортируемыми)
-__all__ = [
-    "start_cmd",
-    "league_callback",
-    "refresh_matches_callback",
-    "back_leagues_callback",
-    "match_callback",
-    "error_handler",
-    "register_handlers",
-]
+def register_handlers(app: Application):
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CallbackQueryHandler(leagues_back_callback, pattern=r"^back:leagues$"))
+    app.add_handler(CallbackQueryHandler(refresh_callback, pattern=r"^refresh:"))
+    app.add_handler(CallbackQueryHandler(league_callback, pattern=r"^league:"))
+    app.add_error_handler(error_handler)
