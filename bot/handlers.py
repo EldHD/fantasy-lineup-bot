@@ -66,20 +66,18 @@ def format_matches(league_code: str, matches: List[Dict]) -> str:
             time_raw = m.get("time_raw") or ""
             ko_txt = f"{date_raw} {time_raw}".strip()
         lines.append(f"• {m['home_team']} vs {m['away_team']} — {ko_txt}")
-    # Ограничим длину чтобы не упереться в лимит сообщения
     return "\n".join(lines)[:3900]
 
 
 # ---------- КОМАНДЫ ----------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Старт – показать выбор лиг."""
     await update.message.reply_text("Выберите лигу:", reply_markup=leagues_keyboard())
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "/start – выбрать лигу\n"
-        "После выбора – парсер покажет ближайшие туры (демо, пока без сохранения в БД)."
+        "После выбора – парсер покажет ближайшие туры (демо)."
     )
 
 
@@ -116,12 +114,10 @@ async def back_leagues_callback(update: Update, context: ContextTypes.DEFAULT_TY
 # ---------- ОБРАБОТЧИК ОШИБОК ----------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled error: %s", context.error)
-    # Постараемся отправить сообщение пользователю (если есть куда)
     try:
-        if isinstance(update, Update):
-            if update.effective_message:
-                await update.effective_message.reply_text("⚠️ Внутренняя ошибка. Попробуйте ещё раз позже.")
-    except Exception:  # noqa
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text("⚠️ Внутренняя ошибка. Попробуйте ещё раз позже.")
+    except Exception:
         pass
 
 
