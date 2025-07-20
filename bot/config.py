@@ -1,8 +1,7 @@
-# bot/config.py
 import os
 from pathlib import Path
 
-# ========= УТИЛИТА ДЛЯ ENV =========
+# ========= ВСПОМОГАТЕЛЬНО =========
 def _env(name: str, default=None, cast=str):
     val = os.getenv(name)
     if val is None or val == "":
@@ -15,14 +14,16 @@ def _env(name: str, default=None, cast=str):
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # ========= TELEGRAM =========
-TELEGRAM_TOKEN = _env("TELEGRAM_TOKEN")  # <== ЭКСПОРТИРУЕМ
+TELEGRAM_TOKEN = _env("TELEGRAM_TOKEN")          # ОБЯЗАТЕЛЬНО задать в env
 
-# ========= БД =========
-DATABASE_URL = _env("DATABASE_URL")
+# ========= ЛОГИ =========
+LOG_LEVEL = _env("LOG_LEVEL", "INFO")
 
-# ========= ЛИГИ / КОМПЕТИЦИИ =========
+# ========= ЛИГИ / КОДЫ =========
+# Внутренние коды лиг (кнопки / callback data)
 LEAGUE_CODES = ["epl", "laliga", "serie_a", "bundesliga", "ligue1", "rpl"]
 
+# Отображение
 LEAGUE_DISPLAY = {
     "epl": "Premier League",
     "laliga": "La Liga",
@@ -43,39 +44,33 @@ TM_COMP_CODES = {
 }
 
 # ========= СЕЗОН =========
-# Начальный год сезона (2025 для сезона 2025/26)
+# Стартовый год (2025 для сезона 2025/26)
 TM_SEASON_YEAR = _env("TM_SEASON_YEAR", 2025, int)
-SEASON_START_YEAR = TM_SEASON_YEAR  # совместимость
+SEASON_START_YEAR = TM_SEASON_YEAR   # alias для совместимости
 
-# ========= MATЧДЕИ СКАН =========
-TM_MAX_MATCHDAY_SCAN = _env("TM_MAX_MATCHDAY_SCAN", 12, int)  # сколько туров перебираем в поиске актуального
-TM_SHOW_MATCHDAY_FUTURE = _env("TM_SHOW_MATCHDAY_FUTURE", 1, int)  # на сколько туров вперёд показывать (если нужен функционал)
+# Сколько туров максимум сканируем при поиске ближайшего актуального
+TM_MAX_MATCHDAY_SCAN = _env("TM_MAX_MATCHDAY_SCAN", 15, int)
 
-# ========= URL-и =========
+# ========= HTTP / SCRAPER =========
 TM_BASE_COM = "https://www.transfermarkt.com"
 TM_BASE_WORLD = "https://www.transfermarkt.world"
 
-# ========= HTTP настройки =========
 TM_TIMEOUT = _env("TM_TIMEOUT", 15, int)
 TM_RETRIES = _env("TM_RETRIES", 2, int)
 TM_DELAY_BASE = _env("TM_DELAY_BASE", 0.9, float)
 
-# User-Agent'ы
 TM_USER_AGENTS = [
+    # Несколько разных, можно рандомизировать
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
 ]
 
-# ========= ЛОГИ =========
-LOG_LEVEL = _env("LOG_LEVEL", "INFO")
-
-# ========= DEBUG =========
-TM_CALENDAR_DEBUG = _env("TM_CALENDAR_DEBUG", 0, int)  # 1 – выводим подробную отладку парсинга
+TM_CALENDAR_DEBUG = _env("TM_CALENDAR_DEBUG", 0, int)  # 1 -> выводить подробную отладку
 
 # ========= ПРОЧЕЕ =========
 PREDICTIONS_LIMIT = _env("PREDICTIONS_LIMIT", 15, int)
 
-# ========= ВАЛИДАЦИЯ КРИТИЧЕСКОГО =========
+# ========= ВАЛИДАЦИЯ =========
 if TELEGRAM_TOKEN is None:
-    raise RuntimeError("Env TELEGRAM_TOKEN is not set")
+    raise RuntimeError("ENV TELEGRAM_TOKEN is not set")
