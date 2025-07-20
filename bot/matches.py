@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 from bot.external.sofascore import (
     get_or_guess_season_id,
@@ -9,19 +9,20 @@ from bot.external.sofascore import (
 
 logger = logging.getLogger(__name__)
 
-# Коды турниров SofaScore (пример: EPL = 17)
+# ID турниров SofaScore (проверь актуальность)
 TOURNAMENT_ID_BY_CODE = {
     "epl": 17,
     "laliga": 8,
     "seriea": 23,
     "bundesliga": 35,
     "ligue1": 34,
-    "rpl": 203,   # пример, проверь реальный ID, если нужно
+    "rpl": 203,
 }
 
-# Кэш: { league_code: { "season_id": int, "events": [...], "fetched_at": datetime } }
+# Кэш матчей
 _MATCH_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL_SECONDS = 15 * 60  # 15 минут
+
 
 def _cache_valid(entry: Dict[str, Any]) -> bool:
     ts: datetime = entry.get("fetched_at")
@@ -30,20 +31,42 @@ def _cache_valid(entry: Dict[str, Any]) -> bool:
     age = (datetime.now(timezone.utc) - ts).total_seconds()
     return age < CACHE_TTL_SECONDS
 
-async def load_matches_for_league(league_code: str, force_refresh: bool = False) -> Dict[str, Any]:
+
+async def load_matches_for_league(
+    league_code: str,
+    force_refresh: bool = False,
+    limit: Optional[int] = None,
+) -> Dict[str, Any]:
     """
-    Возвращает структуру:
+    Возвращает словарь:
     {
-      "ok": bool,
-      "league_code": str,
-      "events": [...],
-      "season_id": ..,
-      "error": str|None,
-      "attempts": [...],
-      "debug": {...},
+      ok: bool,
+      league_code: str,
+      events: list,
+      season_id: int|None,
+      error: str|None,
+      attempts: list,
+      debug: dict
     }
+
+    :param league_code: 'epl', 'laliga', ...
+    :param force_refresh: игнорировать кэш
+    :param limit: если задан – обрезать список событий до limit
     """
-    league_code = league_code.lower()
+    raw_input = league_code
+    league_code = (league_code or "").strip().lower()
+
+    if not league_code:
+        return {
+            "ok": False,
+            "league_code": raw_input,
+            "events": [],
+            "season_id": None,
+            "error": "Empty league code",
+            "attempts": [],
+            "debug": {},
+        }
+
     if league_code not in TOURNAMENT_ID_BY_CODE:
         return {
             "ok": False,
@@ -52,17 +75,20 @@ async def load_matches_for_league(league_code: str, force_refresh: bool = False)
             "season_id": None,
             "error": f"Unknown league code '{league_code}'",
             "attempts": [],
-            "debug": {},
+            "debug": {"input": raw_input},
         }
 
     # Кэш
     if not force_refresh:
         cache_entry = _MATCH_CACHE.get(league_code)
         if cache_entry and _cache_valid(cache_entry):
+            events = cache_entry["events"]
+            if limit is not None:
+                events = events[:limit]
             return {
                 "ok": True,
                 "league_code": league_code,
-                "events": cache_entry["events"],
+                "events": events,
                 "season_id": cache_entry["season_id"],
                 "error": None,
                 "attempts": cache_entry.get("attempts", []),
@@ -70,6 +96,7 @@ async def load_matches_for_league(league_code: str, force_refresh: bool = False)
             }
 
     tournament_id = TOURNAMENT_ID_BY_CODE[league_code]
+
     season_id, debug_season = await get_or_guess_season_id(tournament_id)
     if not season_id:
         return {
@@ -82,13 +109,16 @@ async def load_matches_for_league(league_code: str, force_refresh: bool = False)
             "debug": {"season_debug": debug_season},
         }
 
-    matches_resp = await get_upcoming_matches(season_id=season_id, tournament_id=tournament_id, limit=40)
+    matches_resp = await get_upcoming_matches(
+        season_id=season_id,
+        tournament_id=tournament_id,
+        limit=200  # вытягиваем «с запасом», потом режем
+    )
     events = matches_resp.get("events", [])
     attempts = matches_resp.get("attempts", [])
     errors = matches_resp.get("errors", [])
 
     if not events:
-        # формируем читабельное описание
         err_msg = "Нет матчей"
         if errors:
             err_msg += f"; errors: {errors[:2]}"
@@ -102,13 +132,16 @@ async def load_matches_for_league(league_code: str, force_refresh: bool = False)
             "debug": {"season_debug": debug_season},
         }
 
-    # Сохраняем в кэш
+    # Кладём в кэш полную выборку
     _MATCH_CACHE[league_code] = {
         "season_id": season_id,
         "events": events,
         "attempts": attempts,
         "fetched_at": datetime.now(timezone.utc),
     }
+
+    if limit is not None:
+        events = events[:limit]
 
     return {
         "ok": True,
@@ -120,10 +153,8 @@ async def load_matches_for_league(league_code: str, force_refresh: bool = False)
         "debug": {"season_debug": debug_season},
     }
 
+
 def format_events_short(events: List[Dict[str, Any]], limit: int = 8) -> str:
-    """
-    Форматируем список матчей в короткий текст.
-    """
     lines: List[str] = []
     for ev in events[:limit]:
         h = (ev.get("homeTeam") or {}).get("name", "Home")
