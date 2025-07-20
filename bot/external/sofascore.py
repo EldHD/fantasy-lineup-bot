@@ -1,229 +1,154 @@
 import asyncio
-import logging
-from typing import List, Dict, Optional, Tuple
-from datetime import datetime, timezone
-
 import httpx
+import logging
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT = 25.0
+SOFASCORE_BASE = "https://api.sofascore.com/api/v1"
 
-# code -> unique tournament id (utid) + человеко-читабельный slug для ссылки
-SOFASCORE_TOURNAMENTS = {
-    "epl":        {"utid": 17,  "country": "england",  "slug": "premier-league"},
-    "laliga":     {"utid": 8,   "country": "spain",    "slug": "laliga"},
-    "seriea":     {"utid": 23,  "country": "italy",    "slug": "serie-a"},
-    "bundesliga": {"utid": 35,  "country": "germany",  "slug": "bundesliga"},
-    "ligue1":     {"utid": 34,  "country": "france",   "slug": "ligue-1"},
-    "rpl":        {"utid": 203, "country": "russia",   "slug": "premier-league"},
+# Базовые заголовки “как браузер”
+DEFAULT_HEADERS = {
+    "User-Agent": os.getenv("HTTP_USER_AGENT",
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.sofascore.com",
+    "Referer": "https://www.sofascore.com/",
+    "Connection": "keep-alive",
 }
 
-# ---------- ВСПОМОГАТЕЛЬНОЕ HTTP ----------
+class SofaScoreError(Exception):
+    """Общая ошибка взаимодействия с SofaScore"""
 
-async def _fetch_json(url: str, *, referer: Optional[str] = None) -> Tuple[Optional[dict], int, Optional[str]]:
+async def get_json(
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    max_retries: int = 3,
+    retry_delay: float = 1.2,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
     """
-    Возвращает (json|None, status_code, error_text_snippet)
-    error_text_snippet = обрезок тела при неудачном статусе.
+    Универсальный запрос к SofaScore.
+    Возвращает (json_or_none, error_message_or_none, status_code)
+    Не выбрасывает исключение – чтобы хендлеры могли формировать детальные ответы.
     """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.8",
-        "Origin": "https://www.sofascore.com",
-        "Referer": referer or "https://www.sofascore.com/",
-        "Pragma": "no-cache",
-        "Cache-Control": "no-cache",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
-            r = await client.get(url, headers=headers)
-            status = r.status_code
-            if status == 200:
-                try:
-                    return r.json(), status, None
-                except Exception as e:
-                    logger.error("JSON parse error %s: %s", url, e)
-                    return None, status, f"json-parse-error: {e}"
-            else:
-                snippet = (r.text or "")[:200]
-                logger.warning("SofaScore GET %s -> %s; snippet=%r", url, status, snippet)
-                return None, status, snippet
-    except httpx.HTTPError as e:
-        logger.error("HTTP error %s fetching %s", e, url)
-        return None, 0, f"http-error: {e}"
-    except Exception as e:
-        logger.exception("Unexpected error fetching %s", url)
-        return None, 0, f"unexpected: {e}"
+    url = f"{SOFASCORE_BASE}/{path.lstrip('/')}"
+    last_err = None
+    status = 0
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with httpx.AsyncClient(http2=True, timeout=10.0, headers=DEFAULT_HEADERS) as client:
+                resp = await client.get(url, params=params)
+                status = resp.status_code
+                if status == 200:
+                    try:
+                        return resp.json(), None, status
+                    except Exception as je:
+                        last_err = f"JSON decode error: {je}"
+                        break
+                elif status in (403, 429, 503):
+                    # Лимит / блок / временно недоступно
+                    last_err = f"HTTP {status} {resp.text.strip()[:180]}"
+                    if attempt < max_retries:
+                        await asyncio.sleep(retry_delay * attempt)
+                        continue
+                    break
+                else:
+                    last_err = f"HTTP {status} {resp.text.strip()[:180]}"
+                    break
+        except Exception as e:
+            last_err = f"Request exception: {e}"
+            if attempt < max_retries:
+                await asyncio.sleep(retry_delay * attempt)
+                continue
+            break
+    return None, last_err, status
 
-# ---------- СЕЗОН ----------
 
-async def _resolve_current_season(utid: int, meta: dict) -> Optional[int]:
-    seasons_url = f"https://api.sofascore.com/api/v1/unique-tournament/{utid}/seasons"
-    data, status, err = await _fetch_json(seasons_url)
-    meta["requests"].append({"url": seasons_url, "status": status, "err": err})
-    if status != 200 or not data or "seasons" not in data:
-        meta["reason"] = f"Не удалось получить список сезонов (status={status})"
-        return None
-    seasons = data["seasons"]
-    if not seasons:
-        meta["reason"] = "Пустой список сезонов"
-        return None
+async def fetch_seasons(unique_tournament_id: int) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str], int]:
+    data, err, status = await get_json(f"unique-tournament/{unique_tournament_id}/seasons")
+    if data and "seasons" in data:
+        return data["seasons"], None, status
+    if err is None:
+        err = "Unknown seasons format"
+    return None, err, status
 
-    current = [s for s in seasons if s.get("isCurrent")]
-    if current:
-        sid = current[0].get("id")
-        meta["season_id"] = sid
-        return sid
 
-    seasons_sorted = sorted(seasons, key=lambda s: s.get("startTimestamp") or 0, reverse=True)
-    sid = seasons_sorted[0].get("id")
-    meta["season_id"] = sid
-    meta["season_fallback"] = True
-    return sid
-
-# ---------- НОРМАЛИЗАЦИЯ СОБЫТИЯ ----------
-
-def _event_to_record(ev: dict) -> Optional[Dict]:
-    start_ts = ev.get("startTimestamp")
-    if not start_ts:
-        return None
-    status_type = ev.get("status", {}).get("type")
-    if status_type not in ("notstarted", "postponed"):
-        return None
-    home = ev.get("homeTeam", {}).get("name")
-    away = ev.get("awayTeam", {}).get("name")
-    if not home or not away:
-        return None
-    round_info = ev.get("roundInfo", {})
-    matchday = (
-        round_info.get("round")
-        or ev.get("round")
-        or round_info.get("name")
-    )
-    kickoff_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-    return {
-        "matchday": matchday,
-        "home_team": home,
-        "away_team": away,
-        "kickoff_utc": kickoff_dt,
-        "start_ts": start_ts,
-        "raw_id": ev.get("id"),
-    }
-
-# ---------- ОСНОВНАЯ ФУНКЦИЯ ----------
-
-async def fetch_league_matches_with_meta(league_code: str, limit: int = 10) -> Tuple[List[Dict], dict]:
+async def get_or_guess_season_id(
+    unique_tournament_id: int,
+    fallback_env_name: str = "",
+) -> Tuple[Optional[int], Dict[str, Any]]:
     """
-    Возвращает (matches, meta)
-    meta содержит:
-      - league_code
-      - season_id
-      - season_fallback (bool)
-      - requests: список {url,status,err}
-      - raw_events_count
-      - raw_next_added
-      - reason (почему пусто)
-      - link (страница турнира на SofaScore)
+    Возвращает (season_id, debug_info).
+    debug_info содержит подробности попыток, чтобы вывести пользователю.
+    Логика:
+      1. Попытка получить список сезонов.
+      2. Если 403/ошибка – берем из ENV (fallback_env_name).
+      3. Если нет – возвращаем None.
     """
-    meta = {
-        "league_code": league_code,
+    debug = {
+        "tournament_id": unique_tournament_id,
+        "steps": [],
         "season_id": None,
-        "season_fallback": False,
-        "requests": [],
-        "raw_events_count": 0,
-        "raw_next_added": 0,
-        "reason": None,
-        "link": None,
     }
-    info = SOFASCORE_TOURNAMENTS.get(league_code)
-    if not info:
-        meta["reason"] = "Неизвестный код лиги"
-        return [], meta
 
-    utid = info["utid"]
-    slug = info["slug"]
-    country = info["country"]
-
-    matches: List[Dict] = []
-
-    season_id = await _resolve_current_season(utid, meta)
-    if not season_id:
-        if meta["reason"] is None:
-            meta["reason"] = "Сезон не найден"
-        return [], meta
-
-    # Ссылка для пользователя
-    meta["link"] = f"https://www.sofascore.com/tournament/football/{country}/{slug}/{season_id}"
-
-    # Основные события
-    events_url = f"https://api.sofascore.com/api/v1/unique-tournament/{utid}/season/{season_id}/events"
-    data, status, err = await _fetch_json(events_url)
-    meta["requests"].append({"url": events_url, "status": status, "err": err})
-    if status == 200 and data and "events" in data:
-        meta["raw_events_count"] = len(data["events"])
-        for ev in data["events"]:
-            rec = _event_to_record(ev)
-            if rec:
-                matches.append(rec)
+    seasons, err, status = await fetch_seasons(unique_tournament_id)
+    if seasons:
+        # Берём первый (обычно текущий / будущий)
+        season_id = seasons[0]["id"]
+        debug["steps"].append({"action": "fetch_seasons", "status": status, "result": "ok", "seasons_count": len(seasons)})
+        debug["season_id"] = season_id
+        return season_id, debug
     else:
-        if status != 200:
-            meta["reason"] = f"Основной список событий не получен (status={status})"
+        debug["steps"].append({"action": "fetch_seasons", "status": status, "error": err})
+        # Fallback ENV
+        if fallback_env_name:
+            env_val = os.getenv(fallback_env_name)
+            if env_val and env_val.isdigit():
+                season_id = int(env_val)
+                debug["steps"].append({"action": "env_fallback", "name": fallback_env_name, "value": season_id})
+                debug["season_id"] = season_id
+                return season_id, debug
+            else:
+                debug["steps"].append({"action": "env_fallback", "name": fallback_env_name, "error": "not set or not digit"})
 
-    # Догрузка через next
-    page = 0
-    while len(matches) < limit and page < 6:
-        next_url = (
-            f"https://api.sofascore.com/api/v1/unique-tournament/"
-            f"{utid}/season/{season_id}/events/next/{page}"
-        )
-        next_data, nstatus, nerr = await _fetch_json(next_url)
-        meta["requests"].append({"url": next_url, "status": nstatus, "err": nerr})
-        page += 1
-        if nstatus != 200 or not next_data or "events" not in next_data:
-            break
-        added_here = 0
-        for ev in next_data["events"]:
-            rec = _event_to_record(ev)
-            if rec:
-                if not any(
-                    r["start_ts"] == rec["start_ts"] and
-                    r["home_team"] == rec["home_team"] and
-                    r["away_team"] == rec["away_team"]
-                    for r in matches
-                ):
-                    matches.append(rec)
-                    added_here += 1
-        meta["raw_next_added"] += added_here
-        if added_here == 0:
-            break
-
-    matches.sort(key=lambda r: r["start_ts"])
-    if limit:
-        matches = matches[:limit]
-
-    if not matches and meta["reason"] is None:
-        # Определим, это «действительно пусто» или какая-то проблема
-        if meta["raw_events_count"] == 0 and meta["raw_next_added"] == 0:
-            meta["reason"] = "API вернуло 0 будущих матчей (вероятно календарь ещё не опубликован)"
-        else:
-            meta["reason"] = "Не удалось собрать подходящие матчи (фильтрация/статусы)"
-
-    logger.info(
-        "fetch_league_matches_with_meta(%s) -> %d matches (season=%s) reason=%s",
-        league_code, len(matches), season_id, meta["reason"]
-    )
-    return matches, meta
+    return None, debug
 
 
-# Тест локально
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
-    async def _t():
-        m, meta = await fetch_league_matches_with_meta("epl", 12)
-        print("Matches:", len(m))
-        print("Meta:", meta)
-    asyncio.run(_t())
+async def fetch_upcoming_matches(
+    unique_tournament_id: int,
+    season_id: int,
+    limit: int = 30,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Optional[str]]:
+    """
+    Забираем список ближайших матчей турнира (вариант endpoints).
+    Пробуем несколько путей:
+      1. unique-tournament/<id>/season/<season_id>/events/next/0
+      2. unique-tournament/<id>/events/last/<n>?  (как запасной – но нам нужны будущие)
+      3. популярный endpoint: unique-tournament/<id>/season/<season_id>/fixtures/round/<x> (сложнее – нужен round)
+    Для MVP ограничимся 'events/next/0'.
+    Возвращает (matches, debug, error)
+    """
+    debug = {"attempts": [], "used_endpoint": None}
+    matches: List[Dict[str, Any]] = []
+
+    path = f"unique-tournament/{unique_tournament_id}/season/{season_id}/events/next/0"
+    data, err, status = await get_json(path)
+    debug["attempts"].append({"endpoint": path, "status": status, "error": err})
+    if data and "events" in data:
+        events = data["events"][:limit]
+        for ev in events:
+            matches.append({
+                "id": ev.get("id"),
+                "home": ev.get("homeTeam", {}).get("name"),
+                "away": ev.get("awayTeam", {}).get("name"),
+                "startTimestamp": ev.get("startTimestamp"),
+                "roundInfo": ev.get("roundInfo"),
+            })
+        debug["used_endpoint"] = path
+        return matches, debug, None
+
+    # Если не получилось – сообщаем ошибку
+    return [], debug, err or f"Не удалось получить events (status={status})"
