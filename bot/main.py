@@ -1,31 +1,33 @@
-import asyncio, logging
-from telegram.ext import ApplicationBuilder
+# bot/main.py  (полный файл)
+
+import logging
+from telegram.ext import Application
 from bot.config import TELEGRAM_TOKEN
-from bot.handlers import register_handlers
-from bot.db.patch_schema import apply_async
+from bot.db.patch_schema import apply_sync   # ← остаётся sync-версия!
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s:%(name)s: %(message)s")
-log = logging.getLogger(__name__)
-
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s: %(message)s",
+)
 
 def main() -> None:
-    asyncio.run(start_bot())            # единая точка входа
+    logging.info("🔧 Проверка схемы БД …")
+    apply_sync()                          # ← патчим таблицы (sync)
 
+    logging.info("🤖 Bot starting polling …")
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
 
-async def start_bot() -> None:
-    log.info("🔧 Проверка схемы БД …")
-    await apply_async()                 # дождались, что всё ок
-
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    # 👇 регистрируем обработчики
+    from bot.handlers import register_handlers
     register_handlers(app)
 
-    log.info("🤖 Bot starting polling …")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    await app.updater.idle()
-
+    # единственная строка, которая *реально* запускает бота,
+    # блокирует поток и держит event-loop до Ctrl-C
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
