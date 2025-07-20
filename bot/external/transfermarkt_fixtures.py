@@ -1,9 +1,13 @@
+"""
+Парсинг ближайшего тура (или конкретных туров) с Transfermarkt.
+Упрощённый, без сложных edge-cases. При необходимости усилим.
+"""
+
+import random
 import re
 import time
-import random
-import logging
-from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from datetime import datetime
+from typing import List, Dict, Tuple, Any, Optional
 
 import httpx
 from bs4 import BeautifulSoup
@@ -13,271 +17,202 @@ from bot.config import (
     TM_SEASON_YEAR,
     TM_MAX_MATCHDAY_SCAN,
     TM_BASE_COM,
+    TM_USER_AGENTS,
     TM_TIMEOUT,
-    TM_HEADERS,
+    TM_RETRIES,
+    TM_CALENDAR_DEBUG,
 )
 
-logger = logging.getLogger(__name__)
+# --- Паттерны ---
+RE_MATCH_ID = re.compile(r"/spielbericht/.*/(\d+)")
+# Иногда даты на странице формата 15/08/2025 или 15.08.2025
+RE_DATE = re.compile(r"(\d{1,2})[./](\d{1,2})[./](\d{4})")
+# Время часто '22:00' или '9:00' (бывает без ведущего нуля)
+RE_TIME = re.compile(r"\b(\d{1,2}):(\d{2})\b")
 
 
-@dataclass
-class ParsedMatch:
-    match_id: Optional[int]
-    home: str
-    away: str
-    dt_str: str
-    matchday: Optional[int]
+def _pick_ua() -> str:
+    return random.choice(TM_USER_AGENTS)
 
 
-# ---------- Utility parsing helpers ----------
+def _http_get(url: str) -> Tuple[Optional[str], int, str]:
+    """
+    Возвращает text, status_code, err
+    """
+    for attempt in range(TM_RETRIES + 1):
+        try:
+            headers = {"User-Agent": _pick_ua()}
+            with httpx.Client(timeout=TM_TIMEOUT, headers=headers) as client:
+                resp = client.get(url)
+                if resp.status_code == 200:
+                    return resp.text, resp.status_code, ""
+                else:
+                    err = f"HTTP {resp.status_code}"
+        except Exception as e:
+            err = f"EXC {type(e).__name__}: {e}"
+        # задержка между попытками
+        time.sleep(0.4 + random.random() * 0.6)
+    return None, 0, err
 
-TEAM_SPLIT_RE = re.compile(r"\s+-\s+|\s+vs\s+", re.IGNORECASE)
-ID_RE = re.compile(r"/spielbericht/spielbericht/spielbericht/(\d+)|/spielbericht/(\d+)|/index/spielbericht/(\d+)")
 
-DATE_TIME_CANDIDATE_RE = re.compile(r"(\d{1,2}\.\d{1,2}\.\d{4})|(\d{2}:\d{2})")
-
-WHITESPACE_RE = re.compile(r"\s+")
-
-
-def _clean(s: str) -> str:
-    return WHITESPACE_RE.sub(" ", s).strip()
+def _build_matchday_url(comp_code: str, season_year: int, md: int) -> str:
+    # пример:
+    # https://www.transfermarkt.com/premier-league/gesamtspielplan/wettbewerb/GB1?saison_id=2025&spieltagVon=1&spieltagBis=1
+    return f"{TM_BASE_COM}/premier-league/gesamtspielplan/wettbewerb/{comp_code}?saison_id={season_year}&spieltagVon={md}&spieltagBis={md}"
 
 
-def _row_text(tr) -> str:
-    """Собрать полный текст строки fixtures как одна строка."""
-    return _clean(" ".join(tr.stripped_strings))
+def _extract_text(el) -> str:
+    return el.get_text(" ", strip=True) if el else ""
 
 
-def _extract_match_id(tr) -> Optional[int]:
-    # Попробуем найти ссылку на матч (spielbericht или match report)
-    for a in tr.find_all("a", href=True):
-        href = a["href"]
-        m = re.search(r"/spielbericht/spielbericht/spielbericht/(\d+)", href)
+def _parse_matchday_page(html: str, matchday: int) -> List[Dict[str, Any]]:
+    """
+    Ищем ссылки вида /spielbericht/.../<id> — считаем, что каждая ссылка соответствует матчу.
+    Получаем строку с командами, датой и временем по соседним ячейкам/контексту.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Иногда есть хэдэр с названием тура / датой
+    matches = []
+    seen_ids = set()
+
+    # Чтобы подтягивать "последнюю встреченную дату" (иногда дата общая для группы матчей)
+    last_date: Optional[datetime] = None
+
+    # Соберём все <a> с /spielbericht/
+    for a in soup.select("a[href*='/spielbericht/']"):
+        href = a.get("href", "")
+        m = RE_MATCH_ID.search(href)
         if not m:
-            m = re.search(r"/spielbericht/(\d+)", href)
-        if not m:
-            m = re.search(r"/index/spielbericht/(\d+)", href)
-        if m:
+            continue
+        match_id = m.group(1)
+        if match_id in seen_ids:
+            continue
+
+        # Найдём строку (tr) повыше
+        tr = a.find_parent("tr")
+        if tr is None:
+            continue
+
+        # Извлечём весь текст строки
+        row_txt = _extract_text(tr)
+
+        # Попытаемся из строки или соседей достать команды
+        # Часто команды в отдельных <td> с классами, но упростим:
+        # Разделитель " - " или " vs "
+        home = away = ""
+        if " - " in row_txt:
+            parts = row_txt.split(" - ", 1)
+            home = parts[0].strip()
+            rest = parts[1].strip()
+            # Удалим возможный итоговый счёт в конце (в скобках) для away
+            away = re.split(r"\s+\d+:\d+|\s+\(\d+:\d+\)", rest)[0].strip()
+        elif " vs " in row_txt.lower():
+            parts = re.split(r"(?i)\s+vs\s+", row_txt, 1)
+            home = parts[0].strip()
+            away = parts[1].strip()
+
+        # Дата/время: пробуем сначала в текущем tr
+        dt = None
+        date_match = RE_DATE.search(row_txt)
+        time_match = RE_TIME.search(row_txt)
+
+        if date_match:
+            d, mo, y = date_match.groups()
             try:
-                return int(m.group(1))
-            except:
-                pass
-    return None
+                dt_base = datetime(int(y), int(mo), int(d))
+                last_date = dt_base
+            except ValueError:
+                dt_base = None
+        else:
+            dt_base = last_date  # Если в этой строке нет даты, берём последнюю найденную
 
+        if dt_base and time_match:
+            hh, mm = time_match.groups()
+            try:
+                dt = dt_base.replace(hour=int(hh), minute=int(mm))
+            except ValueError:
+                dt = dt_base
+        else:
+            # Если время не найдено — оставляем только дату
+            dt = dt_base
 
-def _extract_teams_from_row(tr) -> Tuple[Optional[str], Optional[str]]:
-    # На Transfermarkt названия команд обычно в <td class=""> с <a title="Club name">
-    tds = tr.find_all("td")
-    candidates = []
-    for td in tds:
-        a = td.find("a", title=True)
-        if a and not a.find("img"):
-            title = _clean(a.get("title") or a.text)
-            if title and len(title) > 1:
-                candidates.append(title)
+        matches.append({
+            "id": match_id,
+            "matchday": matchday,
+            "home": home,
+            "away": away,
+            "datetime": dt,   # может быть None
+        })
+        seen_ids.add(match_id)
 
-    # Иногда в строке может быть больше элементов (резерв, повтор). Возьмем первые две уникальные.
-    unique = []
-    for c in candidates:
-        if c not in unique:
-            unique.append(c)
-        if len(unique) == 2:
-            break
-
-    if len(unique) == 2:
-        return unique[0], unique[1]
-
-    # fallback: попробуем разрезать общий текст
-    txt = _row_text(tr)
-    parts = TEAM_SPLIT_RE.split(txt)
-    parts = [p for p in (p.strip() for p in parts) if p]
-    if len(parts) >= 2:
-        return parts[0], parts[1]
-    return None, None
-
-
-def _extract_datetime_string(tr) -> str:
-    """
-    На страницах полного календаря дата и время часто в отдельных <td> или в заголовке блока тура.
-    Мы здесь просто собираем все паттерны dd.mm.yyyy и hh:mm и склеиваем.
-    """
-    txt = _row_text(tr)
-    dates = DATE_TIME_CANDIDATE_RE.findall(txt)
-    # dates = list of tuples; flatten
-    flat = []
-    for tpl in dates:
-        for seg in tpl:
-            if seg:
-                flat.append(seg)
-    # Уберем повторы, оставим максимум 2-3 сегмента
-    out = []
-    for f in flat:
-        if f not in out:
-            out.append(f)
-    return " ".join(out)
-
-
-def _parse_fixture_rows(soup: BeautifulSoup, season_start_year: int) -> List[ParsedMatch]:
-    """
-    Ищет основные строки матчей в таблице расписания.
-    Часто нужные <tr> имеют data-matchid или класс 'begegnungZeile'.
-    """
-    matches: List[ParsedMatch] = []
-    table = soup.find("table", class_="items")
-    if not table:
-        # Иногда другой класс
-        table = soup.find("table", {"class": re.compile(r".*matchplan.*")})
-    if not table:
-        return matches
-
-    rows = table.find_all("tr")
-    for tr in rows:
-        classes = tr.get("class") or []
-        cls_join = " ".join(classes)
-        if "begegnungZeile" not in cls_join and "match" not in cls_join and not tr.find("a", href=re.compile("spielbericht")):
-            continue
-
-        home, away = _extract_teams_from_row(tr)
-        if not home or not away:
-            continue
-
-        mid = _extract_match_id(tr)
-        dt_str = _extract_datetime_string(tr)
-
-        matches.append(
-            ParsedMatch(
-                match_id=mid,
-                home=home,
-                away=away,
-                dt_str=dt_str,
-                matchday=None,  # можем дополнить позже
-            )
-        )
     return matches
 
 
-# ----------- HTTP Fetch -----------
-
-def _fetch(url: str, headers=None, timeout=TM_TIMEOUT) -> Tuple[int, str]:
-    hdrs = dict(TM_HEADERS)
-    if headers:
-        hdrs.update(headers)
-    # Небольшая рандомная пауза (чтобы не спамить)
-    time.sleep(0.3 + random.random() * 0.4)
-    try:
-        r = httpx.get(url, headers=hdrs, timeout=timeout)
-        return r.status_code, r.text
-    except Exception as e:
-        logger.warning("Request error %s: %s", url, e)
-        return 0, ""
-
-
-def _compose_matchday_url(comp_code: str, season_year: int, md: int) -> str:
-    # Пример:
-    # https://www.transfermarkt.com/premier-league/gesamtspielplan/wettbewerb/GB1?saison_id=2025&spieltagVon=1&spieltagBis=1
-    return (
-        f"{TM_BASE_COM}/premier-league/gesamtspielplan/wettbewerb/{comp_code}"
-        f"?saison_id={season_year}&spieltagVon={md}&spieltagBis={md}"
-    )
-
-
-def _compose_full_season_url(comp_code: str, season_year: int) -> str:
-    return f"{TM_BASE_COM}/premier-league/gesamtspielplan/wettbewerb/{comp_code}/saison_id/{season_year}"
-
-
-# ----------- Main high-level fetch -----------
-
-def fetch_current_matchday_upcoming(league_code: str, limit: int = 10) -> Tuple[List[Dict], Dict]:
+def fetch_current_matchday_upcoming(
+    league_code: str,
+    limit: int = 15,
+    season_year: int = TM_SEASON_YEAR,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Пытаемся найти ближайший (текущий/предстоящий) тур и вернуть его матчи.
-    Стратегия:
-      1. Сканируем матч-дей от 1 до TM_MAX_MATCHDAY_SCAN.
-      2. Берём первый матч-дей, в котором есть строки (парсятся матчи).
-      3. (Упрощённо) Возвращаем все матчи этого тура (в реальном сезоне можно
-         дописать логику "тур считается текущим пока не сыграны все").
-    На случай проблем возвращаем meta с попытками.
-
-    Возвращает:
-      matches: список словарей
-      meta: { source, season_start_year, attempts, error?(при неудаче) }
+    Ищет ближайший тур с будущими матчами (matchday от 1 до TM_MAX_MATCHDAY_SCAN).
+    Возвращает (matches, meta).
+    meta включает 'error' если пусто, и 'attempts'.
     """
-    meta = {
-        "source": "Transfermarkt (matchday filtered)",
-        "season_start_year": TM_SEASON_YEAR,
-        "attempts": [],
-        "match_count": 0,
-    }
-
-    comp_code = TM_COMP_CODES.get(league_code, TM_COMP_CODES.get("epl"))
+    comp_code = TM_COMP_CODES.get(league_code)
     if not comp_code:
-        meta["error"] = f"Unknown league code {league_code}"
-        return [], meta
+        return [], {"error": f"Unknown league code '{league_code}'"}
 
-    selected_matches: List[ParsedMatch] = []
-    selected_md = None
+    now = datetime.utcnow()
+    attempts = []
+    chosen_md = None
+    chosen_matches: List[Dict[str, Any]] = []
 
     for md in range(1, TM_MAX_MATCHDAY_SCAN + 1):
-        url = _compose_matchday_url(comp_code, TM_SEASON_YEAR, md)
-        status, text = _fetch(url)
-        attempt_info = {"url": url, "status": status, "md": md, "parsed": 0}
-        meta["attempts"].append(attempt_info)
-
-        if status != 200 or not text:
+        url = _build_matchday_url(comp_code, season_year, md)
+        text, status, err = _http_get(url)
+        attempts.append({
+            "md": md,
+            "url": url,
+            "status": status,
+            "err": err,
+        })
+        if not text or status != 200:
             continue
 
-        soup = BeautifulSoup(text, "lxml")
-        parsed = _parse_fixture_rows(soup, TM_SEASON_YEAR)
-        attempt_info["parsed"] = len(parsed)
+        parsed = _parse_matchday_page(text, md)
+        if TM_CALENDAR_DEBUG:
+            print(f"[DEBUG] MD {md} parsed={len(parsed)}")
 
-        if parsed:
-            selected_matches = parsed
-            selected_md = md
+        # Фильтруем только будущие матчи
+        future_matches = []
+        for m in parsed:
+            dt = m.get("datetime")
+            if dt is None:
+                # Если не удалось распарсить дату/время — пропускаем
+                continue
+            if dt >= now:
+                future_matches.append(m)
+
+        if future_matches:
+            chosen_md = md
+            # отсортировать по времени
+            future_matches.sort(key=lambda x: x["datetime"] or datetime(2100, 1, 1))
+            chosen_matches = future_matches[:limit]
             break
 
-    if not selected_matches:
-        meta["error"] = "No upcoming matches in scanned matchdays"
-        return [], meta
+    if not chosen_matches:
+        return [], {
+            "error": "No upcoming matches found",
+            "attempts": attempts,
+            "season_year": season_year,
+            "scanned_up_to": attempts[-1]["md"] if attempts else 0
+        }
 
-    # Обновим matchday у всех
-    for pm in selected_matches:
-        pm.matchday = selected_md
-
-    # Ограничим лимитом
-    sel = selected_matches[:limit]
-    meta["match_count"] = len(sel)
-
-    return [pm.__dict__ for pm in sel], meta
-
-
-def fetch_full_season_first_upcoming(league_code: str, limit: int = 15) -> Tuple[List[Dict], Dict]:
-    """
-    Альтернатива: парсим всю страницу сезона и просто берём первые 'limit' матчей.
-    Используй, если нужна не логика туров, а «просто N ближайших».
-    """
     meta = {
-        "source": "Transfermarkt (full season)",
-        "season_start_year": TM_SEASON_YEAR,
-        "attempts": [],
-        "match_count": 0,
+        "matchday": chosen_md,
+        "attempts": attempts,
+        "season_year": season_year,
+        "count": len(chosen_matches),
     }
-    comp_code = TM_COMP_CODES.get(league_code, TM_COMP_CODES.get("epl"))
-    if not comp_code:
-        meta["error"] = f"Unknown league code {league_code}"
-        return [], meta
-
-    url = _compose_full_season_url(comp_code, TM_SEASON_YEAR)
-    status, text = _fetch(url)
-    meta["attempts"].append({"url": url, "status": status})
-
-    if status != 200 or not text:
-        meta["error"] = f"HTTP {status}"
-        return [], meta
-
-    soup = BeautifulSoup(text, "lxml")
-    parsed = _parse_fixture_rows(soup, TM_SEASON_YEAR)
-    if not parsed:
-        meta["error"] = "No matches parsed"
-        return [], meta
-
-    meta["match_count"] = min(len(parsed), limit)
-    return [pm.__dict__ for pm in parsed[:limit]], meta
+    return chosen_matches, meta
