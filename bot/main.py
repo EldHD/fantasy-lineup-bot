@@ -1,30 +1,21 @@
-import os
-import logging
-from telegram.ext import Application
-from bot.config import BOT_TOKEN
+import asyncio
+from telegram.ext import ApplicationBuilder
+import bot.config as cfg
 from bot.handlers import register_handlers
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s:%(name)s:%(message)s"
-)
-logger = logging.getLogger(__name__)
+def build_application():
+    if not cfg.BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN (BOT_TOKEN) не установлен в переменных окружения.")
 
-
-def build_app() -> Application:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN / TELEGRAM_TOKEN not set")
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(cfg.BOT_TOKEN).build()
     register_handlers(app)
     return app
 
-
 def main():
-    app = build_app()
-    logger.info("Bot starting polling...")
-    # Полноценный список allowed_updates сейчас не нужен – PTB сам определит.
+    app = build_application()
+    print("Bot starting polling...")
+    # allowed_updates можно опустить; PTB сам решит
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
