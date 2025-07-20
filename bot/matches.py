@@ -40,7 +40,12 @@ def render_matches_text(league_code: str, matches: List[MatchDict]) -> str:
     if not matches:
         return f"Нет матчей (лига: {disp})"
     md = matches[0].get("matchday")
-    md_part = f"Тур {md}" if md and md != 10_000 else "Ближайшие матчи"
+    if md == "guessed":
+        md_part = "Тур (оценка)"
+    elif md and md != 10_000:
+        md_part = f"Тур {md}"
+    else:
+        md_part = "Ближайшие матчи"
     lines = [f"{md_part} ({disp}):"]
     for m in matches:
         dt_part = ""
@@ -65,6 +70,10 @@ def render_no_matches_error(league_code: str, err: dict) -> str:
     season_year = err.get("season_year")
     if season_year:
         base.append(f"Season start year: {season_year}")
+
+    strat = err.get("selection_strategy")
+    if strat:
+        base.append(f"Selection strategy: {strat}")
 
     attempts = err.get("attempts") or []
     if attempts:
