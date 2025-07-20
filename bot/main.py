@@ -1,7 +1,8 @@
 import os
-import logging
 import sys
+import logging
 
+from telegram import Update
 from telegram.ext import Application
 
 from bot.handlers import (
@@ -9,7 +10,6 @@ from bot.handlers import (
     error_handler,
 )
 
-# Логирование
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
@@ -25,11 +25,11 @@ def build_application() -> Application:
 
     app = Application.builder().token(token).build()
 
-    # Регистрируем хэндлеры
+    # Регистрация хэндлеров
     for h in get_handlers():
         app.add_handler(h)
 
-    # Обработчик ошибок
+    # Глобальный обработчик ошибок
     app.add_error_handler(error_handler)
 
     return app
@@ -38,7 +38,9 @@ def build_application() -> Application:
 def main():
     app = build_application()
     logger.info("Bot starting polling...")
-    app.run_polling(allowed_updates=Application.ANY_UPDATE_TYPES)
+    # Достаточно просто вызвать run_polling() — allowed_updates не обязателен
+    # (если хочется явно — можно: allowed_updates=Update.ALL_TYPES)
+    app.run_polling()  # или: app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
