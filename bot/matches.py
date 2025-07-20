@@ -76,8 +76,7 @@ def render_no_matches_error(league_code: str, err: dict) -> str:
                 base.append(f" - {url} | status={st} | error={a['error']}")
             else:
                 base.append(
-                    f" - {url} | status={st} | spielbericht={a.get('spielbericht_links')} "
-                    f"| team_rows={a.get('team_rows')} | parsed={a.get('parsed_matches')}"
+                    f" - {url} | status={st} | candidates={a.get('candidate_rows')} | parsed={a.get('parsed_matches')}"
                 )
     errors = err.get("errors")
     if errors:
@@ -89,5 +88,5 @@ def render_no_matches_error(league_code: str, err: dict) -> str:
         base.append(f"DEBUG: {err['debug']}")
 
     base.append("Источник: Transfermarkt (gesamtspielplan)")
-    base.append("Советы: проверь опубликован ли календарь / TM_SEASON_YEAR / позже / другой IP / включи TM_CALENDAR_DEBUG=1 для доп. отладки.")
+    base.append("Советы: проверь опубликован ли календарь / TM_SEASON_YEAR / позже / другой IP / TM_CALENDAR_DEBUG=1.")
     return "\n".join(base)
