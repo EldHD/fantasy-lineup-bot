@@ -34,7 +34,7 @@ TM_COMP_CODES = {
 
 # Локализованный slug (world)
 TM_WORLD_LOCAL_SLUG = {
-    "epl": "premer-liga",     # как в твоём примере (транслит)
+    "epl": "premer-liga",     # локализованный (транслит)
     "laliga": "laliga",
     "serie_a": "serie-a",
     "bundesliga": "bundesliga",
@@ -42,7 +42,7 @@ TM_WORLD_LOCAL_SLUG = {
     "rpl": "premier-liga",
 }
 
-# Английский slug
+# Английский slug (world/com)
 TM_WORLD_EN_SLUG = {
     "epl": "premier-league",
     "laliga": "laliga",
@@ -51,15 +51,24 @@ TM_WORLD_EN_SLUG = {
     "ligue1": "ligue-1",
     "rpl": "premier-liga",
 }
-
 TM_COM_EN_SLUG = TM_WORLD_EN_SLUG.copy()
+
+# Сколько матчей в туре (для эвристики)
+LEAGUE_MATCHES_PER_ROUND = {
+    "epl": 10,
+    "laliga": 10,
+    "serie_a": 10,
+    "bundesliga": 9,   # 18 команд
+    "ligue1": 9,       # 18 команд (с 23/24)
+    "rpl": 8,          # 16 команд
+}
 
 # --- Режимы --------------------------------------------------
 USE_TRANSFERMARKT = True
 USE_SOFASCORE = False
 SHOW_ONLY_NEXT_MATCHDAY = True
 
-DEFAULT_MATCH_LIMIT = 15
+DEFAULT_MATCH_LIMIT = 30  # чуть выше: чтобы мы могли отрезать сами
 
 # --- Transfermarkt источники --------------------------------
 TM_BASE_WORLD = "https://www.transfermarkt.world"
