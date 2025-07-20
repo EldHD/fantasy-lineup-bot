@@ -1,21 +1,23 @@
-import asyncio, logging
-from telegram.ext import Application
+# bot/main.py
+import asyncio
+from telegram.ext import Application, CommandHandler
 from bot.config import TELEGRAM_TOKEN
-from bot.db.patch_schema import apply_async
-from bot.handlers import register_handlers
+from bot.handlers import start             # ваш start-callback
 
-async def start_bot():
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s:%(name)s: %(message)s")
-    await apply_async()
+async def start_bot() -> None:
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    register_handlers(app)
+    app.add_handler(CommandHandler("start", start))
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    await app.updater.idle()
+    # --------------------- главное изменение --------------------
+    #   Было:  await app.updater.idle()
+    #   Стало: await app.run_polling()
+    # ------------------------------------------------------------
+    await app.run_polling()   # асинхронный удобный one-liner
 
 if __name__ == "__main__":
     asyncio.run(start_bot())
