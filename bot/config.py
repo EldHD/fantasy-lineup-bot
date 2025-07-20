@@ -1,32 +1,33 @@
 import os
 import logging
 
-# ----------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # ЛОГИРОВАНИЕ
-# ----------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
-# ----------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # TELEGRAM
-# ----------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or ""
 if not BOT_TOKEN:
-    logger.warning("BOT_TOKEN (или TELEGRAM_TOKEN) не задан – бот не запустится.")
+    logger.warning("BOT_TOKEN / TELEGRAM_TOKEN не задан – бот не запустится.")
 
-# ----------------------------------------------------------------------------------
-# БД (пример, адаптируй под себя)
-# ----------------------------------------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:pass@host/dbname")
+# ------------------------------------------------------------------------------
+# БАЗА ДАННЫХ
+# ------------------------------------------------------------------------------
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+asyncpg://user:pass@host/dbname"
+)
 
-# ----------------------------------------------------------------------------------
-# ЛИГИ / ОТОБРАЖЕНИЕ
-# ----------------------------------------------------------------------------------
-# Коды лиг (внутренние)
+# ------------------------------------------------------------------------------
+# ЛИГИ / КОДЫ / ОТОБРАЖЕНИЕ
+# ------------------------------------------------------------------------------
 LEAGUE_CODES = ["epl", "laliga", "seriea", "bundesliga", "ligue1", "rpl"]
 
-# Отображаемые имена
 LEAGUE_DISPLAY = {
     "epl": "Premier League",
     "laliga": "La Liga",
@@ -36,17 +37,17 @@ LEAGUE_DISPLAY = {
     "rpl": "RPL",
 }
 
-# Transfermarkt коды турниров
+# Transfermarkt tournament codes
 LEAGUE_TM_CODES = {
     "epl": "GB1",
     "laliga": "ES1",
     "seriea": "IT1",
-    "bundesliga": "L1",      # (или "Bundesliga" зависит от твоего парсера – проверь)
+    "bundesliga": "L1",   # проверь соответствует ли твоему парсеру
     "ligue1": "FR1",
     "rpl": "RU1",
 }
 
-# При необходимости (если где-то ещё используется)
+# (Опционально) список команд для синхронизации по лигам
 TOURNAMENT_TEAMS = {
     "epl": [
         "arsenal", "aston_villa", "bournemouth", "brentford", "brighton_hove_albion",
@@ -55,36 +56,88 @@ TOURNAMENT_TEAMS = {
         "nottingham_forest", "southampton", "tottenham_hotspur", "west_ham_united",
         "wolverhampton_wanderers"
     ],
-    # добавь остальные лиги при желании
+    # при необходимости добавь для других лиг
 }
 
-# ----------------------------------------------------------------------------------
-# ПАРАМЕТРЫ Transfermarkt ПАРСЕРА
-# ----------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Transfermarkt – базовые домены и пути
+# ------------------------------------------------------------------------------
+TM_BASE_WORLD = os.getenv("TM_BASE_WORLD", "https://www.transfermarkt.world")
+TM_BASE_COM = os.getenv("TM_BASE_COM", "https://www.transfermarkt.com")
+
+# Шаблон пути «gesamtspielplan» (используется для полноформатного календаря)
+# {slug} = локализованный slug лиги (например 'premier-league' или 'premer-liga')
+# {code} = код турнира (GB1 и т.д.)
+TM_GESAMTSPIELPLAN_PATH = "/{slug}/gesamtspielplan/wettbewerb/{code}"
+
+# Параметры фильтрации по туру: ?saison_id=YYYY&spieltagVon=X&spieltagBis=Y
+TM_QUERY_SEASON_PARAM = "saison_id"
+TM_QUERY_MD_FROM = "spieltagVon"
+TM_QUERY_MD_TO = "spieltagBis"
+
+# ------------------------------------------------------------------------------
+# ПАРАМЕТРЫ ПАРСЕРА КАЛЕНДАРЯ
+# ------------------------------------------------------------------------------
 TM_SEASON_YEAR = int(os.getenv("TM_SEASON_YEAR", "2025"))
 
-# Сколько туров максимум сканировать, чтобы найти ближайший с будущими матчами
-TM_MAX_MATCHDAY_SCAN = int(os.getenv("TM_MAX_MATCHDAY_SCAN", "8"))
+# Сколько подряд туров (matchdays) можно просмотреть вперёд/вниз при поиске
+TM_MAX_MATCHDAY_SCAN = int(os.getenv("TM_MAX_MATCHDAY_SCAN", "12"))
 
-# Параллельные запросы (если используется в твоём fetch_sequential_matchdays)
+# Сколько матчдей одновременно пытаться грузить (если реализован параллелизм)
 TM_MATCHDAY_PARALLEL = int(os.getenv("TM_MATCHDAY_PARALLEL", "2"))
 
-# Включить расширенный вывод отладки календаря (используй при проблемах)
+# Расширенная отладка календаря
 TM_CALENDAR_DEBUG = os.getenv("TM_CALENDAR_DEBUG", "0") == "1"
 
-# Базовый тайм-аут HTTPX (если используешь httpx)
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "15.0"))
+# Минимальное количество предстоящих матчей для остановки сканирования (если нужно)
+TM_MIN_UPCOMING_STOP = int(os.getenv("TM_MIN_UPCOMING_STOP", "5"))
 
-# ----------------------------------------------------------------------------------
-# ПАРАМЕТРЫ РОСТЕРОВ / СИНХРОНИЗАЦИИ (если использовались раньше)
-# ----------------------------------------------------------------------------------
-SYNC_INTERVAL_SEC = int(os.getenv("SYNC_INTERVAL_SEC", str(6 * 3600)))          # 6h
-PREDICT_INTERVAL_SEC = int(os.getenv("PREDICT_INTERVAL_SEC", str(6 * 3600 + 600)))
+# ------------------------------------------------------------------------------
+# HTTP / ЗАДЕРЖКИ
+# ------------------------------------------------------------------------------
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20.0"))
+TM_DELAY_BASE = float(os.getenv("TM_DELAY_BASE", "2.0"))  # базовая задержка между запросами
+TM_DELAY_JITTER = float(os.getenv("TM_DELAY_JITTER", "1.3"))  # добавочный случайный разброс
 
-# Задержка между запросами к Transfermarkt (базовая) – если нужно
-TM_DELAY_BASE = float(os.getenv("TM_DELAY_BASE", "2.0"))
+# ------------------------------------------------------------------------------
+# СИНХРОНИЗАЦИЯ / ПРЕДИКТЫ (Job Queue / Scheduler)
+# ------------------------------------------------------------------------------
+SYNC_INTERVAL_SEC = int(os.getenv("SYNC_INTERVAL_SEC", str(6 * 3600)))         # каждые 6 часов
+PREDICT_INTERVAL_SEC = int(os.getenv("PREDICT_INTERVAL_SEC", str(6 * 3600 + 600)))  # +10 мин
+FIRST_SYNC_DELAY_SEC = int(os.getenv("FIRST_SYNC_DELAY_SEC", "10"))
+FIRST_PREDICT_DELAY_SEC = int(os.getenv("FIRST_PREDICT_DELAY_SEC", "40"))
 
-# ----------------------------------------------------------------------------------
-# ПРОЧЕЕ (если требуется)
-# ----------------------------------------------------------------------------------
-# Добавляй другие константы здесь
+# ------------------------------------------------------------------------------
+# ПРОЧИЕ НАСТРОЙКИ ПРЕДИКТОВ (можешь расширять)
+# ------------------------------------------------------------------------------
+DEFAULT_PREDICTION_SOURCE = os.getenv("DEFAULT_PREDICTION_SOURCE", "baseline")
+
+# ------------------------------------------------------------------------------
+# УТИЛИТАРНЫЕ ФУНКЦИИ / ВСПОМОГАТЕЛЬНЫЕ
+# ------------------------------------------------------------------------------
+def get_transfermarkt_full_url(slug: str, code: str, season_year: int,
+                               md_from: int | None = None, md_to: int | None = None) -> str:
+    """
+    Формирует полный URL (world-домен по умолчанию) для страницы календаря
+    с опциональной фильтрацией по туру.
+    """
+    base = TM_BASE_WORLD  # можно переключать на COM если нужно
+    path = TM_GESAMTSPIELPLAN_PATH.format(slug=slug, code=code)
+    query = f"?{TM_QUERY_SEASON_PARAM}={season_year}"
+    if md_from is not None:
+        query += f"&{TM_QUERY_MD_FROM}={md_from}"
+    if md_to is not None:
+        query += f"&{TM_QUERY_MD_TO}={md_to}"
+    return base + path + query
+
+# ------------------------------------------------------------------------------
+# ВАЛИДАЦИЯ ОСНОВНЫХ КОНСТАНТ
+# ------------------------------------------------------------------------------
+_missing = []
+for name in ["LEAGUE_CODES", "LEAGUE_DISPLAY", "LEAGUE_TM_CODES"]:
+    if name not in globals():
+        _missing.append(name)
+if _missing:
+    logger.error("Config missing required constants: %s", ", ".join(_missing))
+else:
+    logger.debug("Config loaded. Leagues: %s", ", ".join(LEAGUE_CODES))
