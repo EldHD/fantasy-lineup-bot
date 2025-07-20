@@ -1,42 +1,32 @@
 # bot/db/patch_schema.py
 """
-Патч-скрипт для схемы БД.
-Добавляет недостающие колонки, если их ещё нет.
-Запускается синхронно при старте бота.
+Добавляет недостающие столбцы в таблицу matches.
+Работает асинхронно, поэтому вызывать нужно через `await apply_async()`.
 """
 
 import logging
-from sqlalchemy import text, inspect
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from bot.config import DATABASE_URL
 
 log = logging.getLogger(__name__)
 
-# асинхронный движок в проекте
 async_engine = create_async_engine(DATABASE_URL, echo=False, future=True)
-# sync-обёртка для работы в текущем потоке
-sync_engine = async_engine.sync_engine
 
 
-def apply_sync() -> None:
-    """Одноразовая проверка/патч схемы."""
-    with sync_engine.begin() as conn:
-        insp = inspect(conn)
+async def apply_async() -> None:
+    """Проверяем/патчим схему (idempotent)."""
+    async with async_engine.begin() as conn:
+        # PostgreSQL понимает `IF NOT EXISTS`, так что инспекция не нужна
+        log.info("🛠  ALTER TABLE matches ADD COLUMN IF NOT EXISTS status …")
+        await conn.execute(text(
+            "ALTER TABLE IF EXISTS matches "
+            "ADD COLUMN IF NOT EXISTS status VARCHAR(20) "
+            "DEFAULT 'scheduled'"
+        ))
 
-        # -- matches.status ---------------------------------------------------
-        if "status" not in insp.get_columns("matches"):
-            log.info("➕ ALTER TABLE matches ADD COLUMN status VARCHAR(20) DEFAULT 'scheduled'")
-            conn.execute(text(
-                "ALTER TABLE matches "
-                "ADD COLUMN status VARCHAR(20) DEFAULT 'scheduled'"
-            ))
-
-        # -- matches.matchday -------------------------------------------------
-        if "matchday" not in insp.get_columns("matches"):
-            log.info("➕ ALTER TABLE matches ADD COLUMN matchday INT")
-            conn.execute(text(
-                "ALTER TABLE matches "
-                "ADD COLUMN matchday INT"
-            ))
-
-        conn.commit()
+        log.info("🛠  ALTER TABLE matches ADD COLUMN IF NOT EXISTS matchday …")
+        await conn.execute(text(
+            "ALTER TABLE IF EXISTS matches "
+            "ADD COLUMN IF NOT EXISTS matchday INT"
+        ))
