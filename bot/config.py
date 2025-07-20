@@ -1,7 +1,6 @@
 import os
 from pathlib import Path
 
-# ========= ВСПОМОГАТЕЛЬНО =========
 def _env(name: str, default=None, cast=str):
     val = os.getenv(name)
     if val is None or val == "":
@@ -13,17 +12,15 @@ def _env(name: str, default=None, cast=str):
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# ========= TELEGRAM =========
-TELEGRAM_TOKEN = _env("TELEGRAM_TOKEN")          # ОБЯЗАТЕЛЬНО задать в env
+# Telegram
+TELEGRAM_TOKEN = _env("TELEGRAM_TOKEN")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("ENV TELEGRAM_TOKEN is not set")
 
-# ========= ЛОГИ =========
 LOG_LEVEL = _env("LOG_LEVEL", "INFO")
 
-# ========= ЛИГИ / КОДЫ =========
-# Внутренние коды лиг (кнопки / callback data)
+# Leagues
 LEAGUE_CODES = ["epl", "laliga", "serie_a", "bundesliga", "ligue1", "rpl"]
-
-# Отображение
 LEAGUE_DISPLAY = {
     "epl": "Premier League",
     "laliga": "La Liga",
@@ -43,15 +40,10 @@ TM_COMP_CODES = {
     "rpl": "RU1",
 }
 
-# ========= СЕЗОН =========
-# Стартовый год (2025 для сезона 2025/26)
 TM_SEASON_YEAR = _env("TM_SEASON_YEAR", 2025, int)
-SEASON_START_YEAR = TM_SEASON_YEAR   # alias для совместимости
-
-# Сколько туров максимум сканируем при поиске ближайшего актуального
+SEASON_START_YEAR = TM_SEASON_YEAR  # alias
 TM_MAX_MATCHDAY_SCAN = _env("TM_MAX_MATCHDAY_SCAN", 15, int)
 
-# ========= HTTP / SCRAPER =========
 TM_BASE_COM = "https://www.transfermarkt.com"
 TM_BASE_WORLD = "https://www.transfermarkt.world"
 
@@ -60,17 +52,11 @@ TM_RETRIES = _env("TM_RETRIES", 2, int)
 TM_DELAY_BASE = _env("TM_DELAY_BASE", 0.9, float)
 
 TM_USER_AGENTS = [
-    # Несколько разных, можно рандомизировать
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
 ]
 
-TM_CALENDAR_DEBUG = _env("TM_CALENDAR_DEBUG", 0, int)  # 1 -> выводить подробную отладку
+TM_CALENDAR_DEBUG = _env("TM_CALENDAR_DEBUG", 0, int)
 
-# ========= ПРОЧЕЕ =========
 PREDICTIONS_LIMIT = _env("PREDICTIONS_LIMIT", 15, int)
-
-# ========= ВАЛИДАЦИЯ =========
-if TELEGRAM_TOKEN is None:
-    raise RuntimeError("ENV TELEGRAM_TOKEN is not set")
