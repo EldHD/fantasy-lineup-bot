@@ -5,26 +5,27 @@ from telegram.ext import ApplicationBuilder
 
 from bot.config import TELEGRAM_TOKEN
 from bot.handlers import register_handlers
-from bot.db.patch_schema import run_sync as patch_schema
+from bot.db.patch_schema import apply_async as patch_schema_async
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 
 def main() -> None:
-    # 1) патчим таблицы ----------------------------------------------------
+    # 1️⃣ создаём единый event-loop на всё приложение
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # 2️⃣ патчим БД *в этом же* loop
     log.info("🔧 Проверка/патч схемы БД …")
-    patch_schema()
+    loop.run_until_complete(patch_schema_async())
 
-    # после asyncio.run() нужен новый loop
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
-    # 2) запускаем Telegram-бота ------------------------------------------
+    # 3️⃣ Telegram-бот — всё в том же loop
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     register_handlers(app)
 
     log.info("🤖 Bot starting polling …")
-    app.run_polling()
+    app.run_polling()          # Application возьмёт уже текущий loop
 
 
 if __name__ == "__main__":
