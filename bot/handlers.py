@@ -1,8 +1,7 @@
-from typing import List
 from telegram import (
     Update,
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
 from telegram.ext import (
     ContextTypes,
@@ -10,74 +9,65 @@ from telegram.ext import (
     CallbackQueryHandler,
     Application,
 )
-import bot.config as cfg
-from bot.matches import load_matches_for_league, render_fixtures_text
+from bot.config import LEAGUE_CODES, LEAGUE_DISPLAY
+from bot.matches import load_matches_for_league, render_matches_text
 
-# ====== /start ======
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [
-            InlineKeyboardButton(
-                cfg.LEAGUE_DISPLAY.get(code, code),
-                callback_data=f"league:{code}"
-            )
-        ]
-        for code in cfg.LEAGUE_CODES
-    ]
-    await update.message.reply_text(
-        "Выбери лигу:",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
+# ---------- Вспомогательный UI ----------
 
-# ====== CALLBACK: Выбор лиги ======
-async def league_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data or ""
-    _, league_code = data.split(":", 1)
-
-    # Пока всегда matchday=1 (можно расширить позже)
-    matchday = 1
-    fixtures, err = await load_matches_for_league(league_code, matchday=matchday)
-    if err or not fixtures:
-        text = f"Нет матчей (лига: {cfg.LEAGUE_DISPLAY.get(league_code, league_code)})\nПричина: {err or 'Unknown'}"
-        await q.edit_message_text(text)
-        return
-
-    # Кнопки по каждому матчу: callback match:<league>:<match_id>
+def league_keyboard() -> InlineKeyboardMarkup:
     buttons = []
-    for fx in fixtures[:cfg.DEFAULT_MAX_INLINE_BUTTONS]:
-        label = f"{fx['home']} vs {fx['away']}"
-        match_id = fx.get("match_id") or 0
-        buttons.append([
-            InlineKeyboardButton(label, callback_data=f"match:{league_code}:{match_id}")
-        ])
+    row = []
+    for code in LEAGUE_CODES:
+        row.append(InlineKeyboardButton(LEAGUE_DISPLAY.get(code, code), callback_data=f"lg:{code}"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
 
-    text = render_fixtures_text(league_code, fixtures, matchday)
-    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+def refresh_keyboard(league_code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data=f"rf:{league_code}")],
+        [InlineKeyboardButton("🏁 Лиги", callback_data="back:leagues")]
+    ])
 
-# ====== CALLBACK: Выбор матча (заглушка) ======
-async def match_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data or ""
-    parts = data.split(":")
-    if len(parts) != 3:
-        await q.edit_message_text("Некорректный callback данных матча.")
+# ---------- Команды ----------
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Выберите лигу:", reply_markup=league_keyboard())
+
+# ---------- Callback ----------
+
+async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.callback_query:
         return
-    _, league_code, match_id = parts
-    await q.edit_message_text(
-        f"Матч #{match_id} ({cfg.LEAGUE_DISPLAY.get(league_code, league_code)})\n"
-        f"Здесь будет выбор команды и предикты (ещё не реализовано)."
+    cq = update.callback_query
+    data = cq.data or ""
+    await cq.answer()
+
+    if data.startswith("lg:"):
+        league_code = data.split(":", 1)[1]
+        await cq.message.reply_text(f"Лига выбрана: {LEAGUE_DISPLAY.get(league_code, league_code)}\nЗагружаю матчи...")
+        await _send_matches(cq.message.chat_id, league_code, context)
+    elif data.startswith("rf:"):
+        league_code = data.split(":", 1)[1]
+        await cq.message.reply_text("Обновление матчей...")
+        await _send_matches(cq.message.chat_id, league_code, context)
+    elif data == "back:leagues":
+        await cq.message.reply_text("Выберите лигу:", reply_markup=league_keyboard())
+
+async def _send_matches(chat_id: int, league_code: str, context: ContextTypes.DEFAULT_TYPE):
+    matches, meta = await load_matches_for_league(league_code, limit=15)
+    text = render_matches_text(league_code, matches, meta)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=refresh_keyboard(league_code)
     )
 
-# ====== Ошибки ======
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    # Логирование можно расширить
-    print("Ошибка:", context.error)
+# ---------- Регистрация ----------
 
 def register_handlers(app: Application):
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CallbackQueryHandler(league_callback, pattern=r"^league:"))
-    app.add_handler(CallbackQueryHandler(match_callback, pattern=r"^match:"))
-    app.add_error_handler(error_handler)
+    app.add_handler(CallbackQueryHandler(callback_router))
